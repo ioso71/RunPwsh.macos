@@ -1,0 +1,468 @@
+/*
+ * RunPwshPlugin.mm — plugin entry point for the Nextpad++ macOS "RunPwsh"
+ * plugin: a PowerShell-ISE-like panel (Run Script / Run Selection / Stop /
+ * Open in Terminal, plus an install-via-Homebrew banner when `pwsh` isn't
+ * found) built on the RunPwshEngine (process execution) and RunPwshPanelView
+ * (UI) helpers in this same directory.
+ *
+ * This file owns the 5 mandatory C exports (setInfo, getName,
+ * getFuncsArray, beNotified, messageProc) and a small ObjC controller
+ * singleton that bridges the plugin ABI to RunPwshPanelView, mirroring the
+ * structure of the Finder plugin (FinderPlugin.mm) in this same repo.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * VERSION — single source of truth for this plugin's version number.
+ * On every change, bump this AND the version line in README.md, and add
+ * an entry to CHANGELOG.md:
+ *   - Bugfix / small change   → patch (ZZ):  1.1.0 → 1.1.1
+ *   - Feature / medium change → minor (Y):   1.0.10 → 1.1.0
+ *   - Breaking change         → major (XX):  1.9.0 → 2.0.0
+ * ───────────────────────────────────────────────────────────────────────── */
+#define RUNPWSH_PLUGIN_VERSION "1.1.0"
+
+#import <Cocoa/Cocoa.h>
+#include <string.h>
+#include <vector>
+
+#include "NppPluginInterfaceMac.h"
+#import "RunPwshPanelView.h"
+#import "RunPwshEngine.h"
+#import "RunPwshLocalization.h"
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * SCNotification — minimal local mirror (same rationale as FinderPlugin.mm:
+ * we only ever read notifyCode->nmhdr.code, so a full Scintilla.h dependency
+ * isn't worth pulling in for this plugin).
+ * ───────────────────────────────────────────────────────────────────────── */
+extern "C" {
+struct SCNotification {
+    struct {
+        void         *hwndFrom;
+        uintptr_t     idFrom;
+        unsigned int  code;
+    } nmhdr;
+};
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Scintilla SCI_* message numbers used to read the active selection.
+ * NppPluginInterfaceMac.h deliberately doesn't vendor Scintilla.h (see
+ * above), but these specific message numbers are part of Scintilla's
+ * long-stable public wire protocol (unchanged since Scintilla 1.x) — safe
+ * to hardcode rather than vendor the full header for four constants.
+ * ───────────────────────────────────────────────────────────────────────── */
+#define SCI_GETSELTEXT 2161
+
+NppData nppData;
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Menu command table.
+ * ───────────────────────────────────────────────────────────────────────── */
+#define RUNPWSH_FUNC_COUNT 5
+static FuncItem gFuncItems[RUNPWSH_FUNC_COUNT];
+
+static NSString *LocalizedFuncItemName(int idx) {
+    switch (idx) {
+        case 0: return RPLoc(@"RunPwsh-Panel ein-/ausblenden", @"Toggle RunPwsh Panel");
+        case 1: return RPLoc(@"Script ausführen", @"Run Script");
+        case 2: return RPLoc(@"Auswahl ausführen", @"Run Selection");
+        case 3: return RPLoc(@"Vorgang beenden", @"Stop");
+        case 4: return RPLoc(@"Pwsh in Terminal starten", @"Start Pwsh in Terminal");
+        default: return @"";
+    }
+}
+
+/// Recursively searches `menu` for an NSMenuItem with the given tag (same
+/// helper as FinderPlugin.mm — the host builds its Plugins menu, and
+/// Tahoe's flattened variants, as nested NSMenus).
+static NSMenuItem *FindMenuItemWithTag(NSMenu *menu, NSInteger tag) {
+    for (NSMenuItem *item in menu.itemArray) {
+        if (item.tag == tag) return item;
+        if (item.submenu) {
+            NSMenuItem *found = FindMenuItemWithTag(item.submenu, tag);
+            if (found) return found;
+        }
+    }
+    return nil;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Controller
+ * ───────────────────────────────────────────────────────────────────────── */
+@interface RunPwshPluginController : NSObject <RunPwshPanelViewDelegate>
++ (instancetype)shared;
+- (void)handleReady;
+- (void)handleBeforeShutdown;
+- (void)togglePanel;
+- (void)runScriptAction;
+- (void)runSelectionAction;
+- (void)stopAction;
+- (void)openTerminalAction;
+- (void)relocalizeMenuItems;
+@end
+
+@implementation RunPwshPluginController {
+    RunPwshPanelView *_panelView;
+    uintptr_t _panelHandle;
+    BOOL _panelVisible;
+    RunPwshEngine *_engine;
+    NSString *_cachedPwshPath;   // nil means "checked and not found"; re-probed each time the panel becomes visible/before a run
+    BOOL _pwshChecked;
+}
+
++ (instancetype)shared {
+    static RunPwshPluginController *sInstance = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ sInstance = [[RunPwshPluginController alloc] init]; });
+    return sInstance;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _engine = [[RunPwshEngine alloc] init];
+    }
+    return self;
+}
+
+#pragma mark - nppData helpers
+
+/// Reads the active buffer's full path via NPPM_GETFULLCURRENTPATH. Returns
+/// nil if there is no active/unsaved-untitled buffer.
+- (nullable NSString *)currentFilePath {
+    char buf[4096] = {0};
+    nppData._sendMessage(nppData._nppHandle, NPPM_GETFULLCURRENTPATH, 0, (intptr_t)buf);
+    if (buf[0] == '\0') return nil;
+    return [NSString stringWithUTF8String:buf];
+}
+
+/// The Scintilla handle backing whichever editor view (main/second) is
+/// currently active — mirrors the standard Notepad++ plugin idiom for
+/// NPPM_GETCURRENTSCINTILLA (wParam unused, lParam is an int* that receives
+/// 0 for the main view or 1 for the second view).
+- (NppHandle)currentScintillaHandle {
+    int which = 0;
+    nppData._sendMessage(nppData._nppHandle, NPPM_GETCURRENTSCINTILLA, 0, (intptr_t)&which);
+    return which == 1 ? nppData._scintillaSecondHandle : nppData._scintillaMainHandle;
+}
+
+/// Current selection text in the active editor, or nil if there is none.
+- (nullable NSString *)currentSelectionText {
+    NppHandle sci = [self currentScintillaHandle];
+    intptr_t len = nppData._sendMessage(sci, SCI_GETSELTEXT, 0, 0);
+    if (len <= 1) return nil; // Scintilla includes the NUL terminator in the reported length
+    std::vector<char> buf((size_t)len);
+    nppData._sendMessage(sci, SCI_GETSELTEXT, 0, (intptr_t)buf.data());
+    NSString *text = [NSString stringWithUTF8String:buf.data()];
+    return text.length > 0 ? text : nil;
+}
+
+#pragma mark - Panel lifecycle
+
+- (void)ensurePanelCreated {
+    if (_panelView) return;
+
+    _panelView = [[RunPwshPanelView alloc] initWithFrame:NSMakeRect(0, 0, 320, 260)];
+    _panelView.delegate = self;
+
+    uintptr_t handle = (uintptr_t)nppData._sendMessage(
+        nppData._nppHandle, NPPM_DMM_REGISTERPANEL,
+        (uintptr_t)(__bridge void *)_panelView, (intptr_t)"RunPwsh");
+    _panelHandle = handle;
+
+    if (_panelHandle == 0) {
+        NSLog(@"[RunPwsh plugin] NPPM_DMM_REGISTERPANEL failed — host may predate panel docking support (< 1.0.3). Panel will not be available.");
+    }
+
+    [self refreshPwshStatus];
+}
+
+- (void)handleReady {
+    [self ensurePanelCreated];
+
+    [RunPwshLocalization observeLanguageChangesWithBlock:^{
+        [[RunPwshPluginController shared] relocalizeMenuItems];
+    }];
+
+    if (!_panelHandle) return;
+
+    // Deferred by one runloop tick: see FinderPlugin.mm's -handleReady for
+    // the exact race this avoids (NPPN_READY firing before the main
+    // window's split-view geometry has settled on first launch).
+    dispatch_async(dispatch_get_main_queue(), ^{
+        intptr_t result = nppData._sendMessage(nppData._nppHandle, NPPM_DMM_SHOWPANEL, self->_panelHandle, 0);
+        self->_panelVisible = (result != 0);
+    });
+}
+
+- (void)relocalizeMenuItems {
+    for (int i = 0; i < RUNPWSH_FUNC_COUNT; i++) {
+        NSString *title = LocalizedFuncItemName(i);
+        strlcpy(gFuncItems[i]._itemName, title.UTF8String, NPP_MENU_ITEM_SIZE);
+        NSMenuItem *item = FindMenuItemWithTag(NSApp.mainMenu, (NSInteger)gFuncItems[i]._cmdID);
+        if (item) item.title = title;
+    }
+}
+
+- (void)handleBeforeShutdown {
+    [_engine stop];
+    if (_panelHandle) {
+        nppData._sendMessage(nppData._nppHandle, NPPM_DMM_UNREGISTERPANEL, _panelHandle, 0);
+        _panelHandle = 0;
+    }
+}
+
+- (void)togglePanel {
+    [self ensurePanelCreated];
+    if (!_panelHandle) return;
+
+    if (_panelVisible) {
+        nppData._sendMessage(nppData._nppHandle, NPPM_DMM_HIDEPANEL, _panelHandle, 0);
+    } else {
+        nppData._sendMessage(nppData._nppHandle, NPPM_DMM_SHOWPANEL, _panelHandle, 0);
+        [self refreshPwshStatus];
+    }
+    _panelVisible = !_panelVisible;
+}
+
+/// Ensures the panel is created + visible, e.g. before showing run output —
+/// matches the ISE's own behavior of surfacing its console pane the moment
+/// something is run.
+- (void)ensurePanelShown {
+    [self ensurePanelCreated];
+    if (_panelHandle && !_panelVisible) {
+        nppData._sendMessage(nppData._nppHandle, NPPM_DMM_SHOWPANEL, _panelHandle, 0);
+        _panelVisible = YES;
+    }
+}
+
+#pragma mark - pwsh / brew detection
+
+- (void)refreshPwshStatus {
+    NSString *path = [RunPwshEngine findPwshPath];
+    _cachedPwshPath = path;
+    _pwshChecked = YES;
+
+    if (path) {
+        [_panelView showInstallBanner:NO reason:nil canInstall:NO];
+        [_panelView setStatusText:[NSString stringWithFormat:@"pwsh: %@", path]];
+    } else {
+        NSString *brew = [RunPwshEngine findBrewPath];
+        if (brew) {
+            [_panelView showInstallBanner:YES
+                                    reason:RPLoc(@"PowerShell (pwsh) wurde nicht gefunden.", @"PowerShell (pwsh) was not found.")
+                                canInstall:YES];
+        } else {
+            [_panelView showInstallBanner:YES
+                                    reason:RPLoc(@"PowerShell (pwsh) und Homebrew wurden nicht gefunden. Bitte Homebrew von brew.sh installieren.",
+                                                 @"Neither PowerShell (pwsh) nor Homebrew was found. Please install Homebrew from brew.sh first.")
+                                canInstall:NO];
+        }
+        [_panelView setStatusText:RPLoc(@"pwsh nicht gefunden", @"pwsh not found")];
+    }
+}
+
+#pragma mark - Run actions
+
+- (void)runScriptAction {
+    [self ensurePanelShown];
+    if (_engine.isRunning) return;
+
+    NSString *pwsh = [RunPwshEngine findPwshPath];
+    if (!pwsh) {
+        [self refreshPwshStatus];
+        return;
+    }
+
+    // Auto-save first (matches PowerShell ISE's F5 behavior): the executed
+    // .ps1 should always reflect what's currently in the editor, not the
+    // last manually-saved state. On an untitled/never-saved buffer this
+    // triggers the host's own Save As dialog; if the user cancels it,
+    // NPPM_GETFULLCURRENTPATH below still comes back empty and we report
+    // that instead of trying to run nothing.
+    nppData._sendMessage(nppData._nppHandle, NPPM_SAVECURRENTFILE, 0, 0);
+
+    NSString *path = [self currentFilePath];
+    if (!path) {
+        [_panelView appendOutputText:RPLoc(@"Bitte zuerst eine Datei speichern.\n", @"Please save a file first.\n")];
+        return;
+    }
+
+    [_panelView clearOutput];
+    [_panelView setRunningState:YES];
+    NSString *cwd = [path stringByDeletingLastPathComponent];
+    __weak RunPwshPluginController *weakSelf = self;
+    [_engine runScriptAtPath:path
+                     pwshPath:pwsh
+             workingDirectory:cwd
+                       output:^(NSString *text) {
+        RunPwshPluginController *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf->_panelView appendOutputText:text];
+    } completion:^(int exitCode) {
+        RunPwshPluginController *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf->_panelView appendOutputText:[NSString stringWithFormat:@"\n[%@ %d]\n",
+            RPLoc(@"Beendet mit Exit-Code", @"Finished with exit code"), exitCode]];
+        [strongSelf->_panelView setRunningState:NO];
+    }];
+}
+
+- (void)runSelectionAction {
+    [self ensurePanelShown];
+    if (_engine.isRunning) return;
+
+    NSString *pwsh = [RunPwshEngine findPwshPath];
+    if (!pwsh) {
+        [self refreshPwshStatus];
+        return;
+    }
+
+    NSString *selection = [self currentSelectionText];
+    if (!selection) {
+        [_panelView appendOutputText:RPLoc(@"Keine Auswahl vorhanden.\n", @"No selection.\n")];
+        return;
+    }
+
+    [_panelView clearOutput];
+    [_panelView setRunningState:YES];
+    NSString *path = [self currentFilePath];
+    NSString *cwd = path ? [path stringByDeletingLastPathComponent] : NSHomeDirectory();
+    __weak RunPwshPluginController *weakSelf = self;
+    [_engine runSelectionText:selection
+                       pwshPath:pwsh
+               workingDirectory:cwd
+                         output:^(NSString *text) {
+        RunPwshPluginController *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf->_panelView appendOutputText:text];
+    } completion:^(int exitCode) {
+        RunPwshPluginController *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf->_panelView appendOutputText:[NSString stringWithFormat:@"\n[%@ %d]\n",
+            RPLoc(@"Beendet mit Exit-Code", @"Finished with exit code"), exitCode]];
+        [strongSelf->_panelView setRunningState:NO];
+    }];
+}
+
+- (void)stopAction {
+    [_engine stop];
+}
+
+- (void)openTerminalAction {
+    NSString *pwsh = [RunPwshEngine findPwshPath];
+    if (!pwsh) {
+        [self ensurePanelShown];
+        [self refreshPwshStatus];
+        return;
+    }
+    NSString *path = [self currentFilePath];
+    NSString *cwd = path ? [path stringByDeletingLastPathComponent] : NSHomeDirectory();
+    [RunPwshEngine openInteractivePwshInTerminal:pwsh workingDirectory:cwd];
+}
+
+- (void)installPwshAction {
+    NSString *brew = [RunPwshEngine findBrewPath];
+    if (!brew) return; // banner already reflects "install Homebrew manually" in this case
+    [_panelView clearOutput];
+    [_panelView appendOutputText:RPLoc(@"Installiere PowerShell via Homebrew…\n", @"Installing PowerShell via Homebrew…\n")];
+    [_panelView setRunningState:YES];
+    __weak RunPwshPluginController *weakSelf = self;
+    [RunPwshEngine installPwshViaHomebrew:brew
+                                     output:^(NSString *text) {
+        RunPwshPluginController *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf->_panelView appendOutputText:text];
+    } completion:^(BOOL success) {
+        RunPwshPluginController *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf->_panelView setRunningState:NO];
+        [strongSelf->_panelView appendOutputText:success
+            ? RPLoc(@"\nInstallation abgeschlossen.\n", @"\nInstallation finished.\n")
+            : RPLoc(@"\nInstallation fehlgeschlagen.\n", @"\nInstallation failed.\n")];
+        [strongSelf refreshPwshStatus];
+    }];
+}
+
+#pragma mark - RunPwshPanelViewDelegate
+
+- (void)runPwshPanelViewDidRequestRunScript:(RunPwshPanelView *)view { (void)view; [self runScriptAction]; }
+- (void)runPwshPanelViewDidRequestRunSelection:(RunPwshPanelView *)view { (void)view; [self runSelectionAction]; }
+- (void)runPwshPanelViewDidRequestStop:(RunPwshPanelView *)view { (void)view; [self stopAction]; }
+- (void)runPwshPanelViewDidRequestOpenTerminal:(RunPwshPanelView *)view { (void)view; [self openTerminalAction]; }
+- (void)runPwshPanelViewDidRequestInstallPwsh:(RunPwshPanelView *)view { (void)view; [self installPwshAction]; }
+- (void)runPwshPanelView:(RunPwshPanelView *)view didSendInputLine:(NSString *)text { (void)view; [_engine sendInputLine:text]; }
+
+@end
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Plugin command callbacks (plain C function pointers, no captured context).
+ * ───────────────────────────────────────────────────────────────────────── */
+
+static void Cmd_TogglePanel(void)    { [[RunPwshPluginController shared] togglePanel]; }
+static void Cmd_RunScript(void)      { [[RunPwshPluginController shared] runScriptAction]; }
+static void Cmd_RunSelection(void)   { [[RunPwshPluginController shared] runSelectionAction]; }
+static void Cmd_Stop(void)           { [[RunPwshPluginController shared] stopAction]; }
+static void Cmd_OpenTerminal(void)   { [[RunPwshPluginController shared] openTerminalAction]; }
+
+extern "C" {
+
+NPP_EXPORT void setInfo(struct NppData data) {
+    nppData = data;
+
+    memset(gFuncItems, 0, sizeof(gFuncItems));
+
+    strlcpy(gFuncItems[0]._itemName, LocalizedFuncItemName(0).UTF8String, NPP_MENU_ITEM_SIZE);
+    gFuncItems[0]._pFunc = Cmd_TogglePanel;
+
+    strlcpy(gFuncItems[1]._itemName, LocalizedFuncItemName(1).UTF8String, NPP_MENU_ITEM_SIZE);
+    gFuncItems[1]._pFunc = Cmd_RunScript;
+
+    strlcpy(gFuncItems[2]._itemName, LocalizedFuncItemName(2).UTF8String, NPP_MENU_ITEM_SIZE);
+    gFuncItems[2]._pFunc = Cmd_RunSelection;
+
+    strlcpy(gFuncItems[3]._itemName, LocalizedFuncItemName(3).UTF8String, NPP_MENU_ITEM_SIZE);
+    gFuncItems[3]._pFunc = Cmd_Stop;
+
+    strlcpy(gFuncItems[4]._itemName, LocalizedFuncItemName(4).UTF8String, NPP_MENU_ITEM_SIZE);
+    gFuncItems[4]._pFunc = Cmd_OpenTerminal;
+}
+
+NPP_EXPORT const char *getName(void) {
+    return "RunPwsh";
+}
+
+NPP_EXPORT struct FuncItem *getFuncsArray(int *nbF) {
+    *nbF = RUNPWSH_FUNC_COUNT;
+    return gFuncItems;
+}
+
+NPP_EXPORT void beNotified(struct SCNotification *notifyCode) {
+    if (!notifyCode) return;
+    switch (notifyCode->nmhdr.code) {
+        case NPPN_READY:
+            [[RunPwshPluginController shared] handleReady];
+            // Registers the single main toolbar/menu-band icon for the
+            // "toggle panel" command. lParam=NULL → host falls back to its
+            // default lookup convention (toolbar.png / toolbar_dark.png in
+            // the plugin's resources/ directory) — same convention as the
+            // Finder plugin's one main icon.
+            nppData._sendMessage(nppData._nppHandle, NPPM_ADDTOOLBARICON_FORDARKMODE,
+                                  (uintptr_t)gFuncItems[0]._cmdID, (intptr_t)NULL);
+            break;
+        case NPPN_BEFORESHUTDOWN:
+            [[RunPwshPluginController shared] handleBeforeShutdown];
+            break;
+        default:
+            break;
+    }
+}
+
+NPP_EXPORT intptr_t messageProc(uint32_t Message, uintptr_t wParam, intptr_t lParam) {
+    (void)Message;
+    (void)wParam;
+    (void)lParam;
+    return 0;
+}
+
+} /* extern "C" */
