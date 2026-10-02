@@ -39,11 +39,7 @@ static NSString *_Nullable RunPwshFirstExisting(NSArray<NSString *> *candidates)
     return nil;
 }
 
-@implementation RunPwshEngine {
-    NSTask *_currentTask;
-    NSString *_pendingTempFileToDelete;
-    NSFileHandle *_stdinHandle; // write end of the current task's stdin pipe; nil when nothing is running
-}
+@implementation RunPwshEngine
 
 + (nullable NSString *)findPwshPath {
     NSString *known = RunPwshFirstExisting(@[
@@ -65,41 +61,25 @@ static NSString *_Nullable RunPwshFirstExisting(NSArray<NSString *> *candidates)
     return RunPwshShellLookup(@"command -v brew");
 }
 
-- (BOOL)isRunning {
-    return _currentTask != nil && _currentTask.isRunning;
-}
-
-/// Shared plumbing for -runScriptAtPath:... and +installPwshViaHomebrew:...:
-/// launches `launchPath` with `arguments`, streams combined stdout+stderr to
+/// Shared plumbing for +installPwshViaHomebrew:...: launches `launchPath`
+/// with `arguments` over a plain NSPipe (fine here — brew's install output
+/// isn't interactive, unlike a pwsh script/selection run, which since
+/// v2.0.0 goes through the panel's embedded terminal instead of this class;
+/// see RunPwshEngine.h's doc comment), streams combined stdout+stderr to
 /// `output` (main thread, as text arrives), and calls `completion` (main
-/// thread) once with the exit code. `cleanup` (if non-nil) runs right before
-/// `completion`, still off the main thread, e.g. to delete a temp file.
+/// thread) once with the exit code.
 - (void)launchTaskAtPath:(NSString *)launchPath
                 arguments:(NSArray<NSString *> *)arguments
-        workingDirectory:(nullable NSString *)workingDirectory
                    output:(void (^)(NSString *text))output
-                  cleanup:(nullable void (^)(void))cleanup
                completion:(void (^)(int exitCode))completion {
     NSTask *task = [[NSTask alloc] init];
     task.launchPath = launchPath;
     task.arguments = arguments;
-    if (workingDirectory.length > 0) {
-        task.currentDirectoryPath = workingDirectory;
-    }
 
     NSPipe *pipe = [NSPipe pipe];
     task.standardOutput = pipe;
-    task.standardError = pipe; // combined stream, like a real terminal — order between stdout/stderr is best-effort
+    task.standardError = pipe;
     NSFileHandle *readHandle = pipe.fileHandleForReading;
-
-    // stdin pipe: lets -sendInputLine: answer interactive prompts (tenant/
-    // subscription pickers, Read-Host, [Y/n] confirms) while the task runs.
-    // Without this, pwsh's stdin is NUL/closed and any prompt just hangs
-    // forever with no way to respond from the panel.
-    NSPipe *inputPipe = [NSPipe pipe];
-    task.standardInput = inputPipe;
-    NSFileHandle *stdinHandle = inputPipe.fileHandleForWriting;
-    _stdinHandle = stdinHandle;
 
     readHandle.readabilityHandler = ^(NSFileHandle *handle) {
         NSData *data = [handle availableData];
@@ -111,91 +91,19 @@ static NSString *_Nullable RunPwshFirstExisting(NSArray<NSString *> *candidates)
         });
     };
 
-    __weak RunPwshEngine *weakSelf = self;
     task.terminationHandler = ^(NSTask *finishedTask) {
         readHandle.readabilityHandler = nil; // stop the handler before draining anything further
-        [stdinHandle closeFile];
-        if (cleanup) cleanup();
         dispatch_async(dispatch_get_main_queue(), ^{
-            RunPwshEngine *strongSelf = weakSelf;
-            if (strongSelf && strongSelf->_currentTask == finishedTask) {
-                strongSelf->_currentTask = nil;
-                if (strongSelf->_stdinHandle == stdinHandle) {
-                    strongSelf->_stdinHandle = nil;
-                }
-            }
             completion((int)finishedTask.terminationStatus);
         });
     };
 
-    _currentTask = task;
     @try {
         [task launch];
     } @catch (NSException *ex) {
         readHandle.readabilityHandler = nil;
-        [stdinHandle closeFile];
-        _currentTask = nil;
-        _stdinHandle = nil;
-        if (cleanup) cleanup();
         output([NSString stringWithFormat:@"Fehler / Error: %@\n", ex.reason ?: ex.description]);
         completion(-1);
-    }
-}
-
-- (void)sendInputLine:(NSString *)text {
-    if (!_stdinHandle || text.length == 0) return;
-    NSString *line = [text hasSuffix:@"\n"] ? text : [text stringByAppendingString:@"\n"];
-    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
-    if (!data) return;
-    @try {
-        [_stdinHandle writeData:data];
-    } @catch (NSException *ex) {
-        NSLog(@"[RunPwsh plugin] Failed to write to stdin: %@", ex);
-    }
-}
-
-- (void)runScriptAtPath:(NSString *)scriptPath
-             pwshPath:(NSString *)pwshPath
-      workingDirectory:(nullable NSString *)workingDirectory
-                output:(void (^)(NSString *text))output
-            completion:(void (^)(int exitCode))completion {
-    [self launchTaskAtPath:pwshPath
-                  arguments:@[@"-NoLogo", @"-NoProfile", @"-ExecutionPolicy", @"Bypass", @"-File", scriptPath]
-          workingDirectory:workingDirectory
-                     output:output
-                    cleanup:nil
-                 completion:completion];
-}
-
-- (void)runSelectionText:(NSString *)scriptText
-                 pwshPath:(NSString *)pwshPath
-         workingDirectory:(nullable NSString *)workingDirectory
-                   output:(void (^)(NSString *text))output
-               completion:(void (^)(int exitCode))completion {
-    NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
-        [NSString stringWithFormat:@"RunPwsh-selection-%@.ps1", [NSUUID UUID].UUIDString]];
-    NSError *writeError = nil;
-    BOOL wrote = [scriptText writeToFile:tempPath atomically:YES encoding:NSUTF8StringEncoding error:&writeError];
-    if (!wrote) {
-        output([NSString stringWithFormat:@"Konnte temporäre Datei nicht schreiben / Could not write temp file: %@\n",
-                 writeError.localizedDescription ?: @"?"]);
-        completion(-1);
-        return;
-    }
-
-    [self launchTaskAtPath:pwshPath
-                  arguments:@[@"-NoLogo", @"-NoProfile", @"-ExecutionPolicy", @"Bypass", @"-File", tempPath]
-          workingDirectory:workingDirectory
-                     output:output
-                    cleanup:^{
-                        [[NSFileManager defaultManager] removeItemAtPath:tempPath error:nil];
-                    }
-                 completion:completion];
-}
-
-- (void)stop {
-    if (_currentTask && _currentTask.isRunning) {
-        [_currentTask terminate];
     }
 }
 
@@ -245,9 +153,7 @@ static NSString *_Nullable RunPwshFirstExisting(NSArray<NSString *> *candidates)
     // otherwise be deallocated immediately after this method returns).
     [engine launchTaskAtPath:brewPath
                     arguments:@[@"install", @"--cask", @"powershell"]
-            workingDirectory:nil
                        output:output
-                      cleanup:nil
                    completion:^(int exitCode) {
         (void)engine; // retained by this block until it runs
         completion(exitCode == 0);

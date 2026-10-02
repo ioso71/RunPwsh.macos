@@ -1,11 +1,21 @@
 /*
- * RunPwshEngine.h — everything that talks to the outside world: finding a
- * `pwsh` (PowerShell 7+) binary, running scripts/selections as an NSTask
- * with live stdout/stderr streaming, stopping a run, launching an
- * interactive pwsh session in Terminal, and installing PowerShell via
- * Homebrew. Deliberately has no dependency on NppPluginInterfaceMac.h or
- * nppData — it only knows about files, paths and processes, so it could be
- * unit-tested or reused standalone.
+ * RunPwshEngine.h — everything that talks to the outside world *except*
+ * actually running a script/selection: finding a `pwsh` (PowerShell 7+)
+ * binary, launching an interactive pwsh session in Terminal, and installing
+ * PowerShell via Homebrew. Deliberately has no dependency on
+ * NppPluginInterfaceMac.h or nppData — it only knows about files, paths and
+ * processes, so it could be unit-tested or reused standalone.
+ *
+ * Since v2.0.0, "Run Script"/"Run Selection" no longer go through this class
+ * (see CHANGELOG 2.0.0): the panel's embedded terminal (RunPwshTerminalBridge,
+ * SwiftTerm's LocalProcessTerminalView) now spawns and owns that process
+ * itself, attached to its own pty, so the user can type directly into the
+ * terminal widget and PSReadLine-driven interactive prompts (Get-Credential,
+ * Connect-AzAccount's picker, Enter-PSSession's credential fallback) work
+ * correctly. This class's own +findPwshPath/+findBrewPath are still what
+ * resolves the executable/arguments the panel then hands to the terminal
+ * bridge; +installPwshViaHomebrew:... and +openInteractivePwshInTerminal:...
+ * are unaffected (neither one is interactive in a way that needs a pty).
  */
 #import <Foundation/Foundation.h>
 
@@ -26,49 +36,6 @@ NS_ASSUME_NONNULL_BEGIN
 /// Same two-stage strategy as +findPwshPath.
 + (nullable NSString *)findBrewPath;
 
-/// YES while a script/selection/install NSTask launched by this instance is
-/// still running.
-@property (nonatomic, readonly) BOOL isRunning;
-
-/// Runs `<pwsh> -NoLogo -NoProfile -ExecutionPolicy Bypass -File <scriptPath>`
-/// with `workingDirectory` as the current directory. `output` is called on
-/// the main thread with each decoded chunk of combined stdout/stderr as it
-/// arrives (line-buffering is the caller's concern, not this method's).
-/// `completion` is called on the main thread exactly once, with the
-/// process's exit code (or -1 if it couldn't be launched at all, in which
-/// case `output` also receives a human-readable error first).
-- (void)runScriptAtPath:(NSString *)scriptPath
-             pwshPath:(NSString *)pwshPath
-      workingDirectory:(nullable NSString *)workingDirectory
-                output:(void (^)(NSString *text))output
-            completion:(void (^)(int exitCode))completion;
-
-/// Convenience for "Run Selection": writes `scriptText` to a private temp
-/// .ps1 file (so error messages keep real line numbers, unlike piping
-/// through -Command) and runs it exactly like -runScriptAtPath:..., deleting
-/// the temp file again once the process exits.
-///
-/// Known limitation (v1.0.0): unlike the real PowerShell ISE, each call
-/// starts a brand-new pwsh process, so variables/functions defined by one
-/// "Run Selection" are NOT visible to the next one. A persistent background
-/// pwsh session (feeding commands over stdin) would fix this but is a much
-/// bigger change — noted in CHANGELOG "Known limitations" for now.
-- (void)runSelectionText:(NSString *)scriptText
-                 pwshPath:(NSString *)pwshPath
-         workingDirectory:(nullable NSString *)workingDirectory
-                   output:(void (^)(NSString *text))output
-               completion:(void (^)(int exitCode))completion;
-
-/// Terminates the currently-running task, if any. Safe to call when nothing
-/// is running (no-op).
-- (void)stop;
-
-/// Writes `text` (with a trailing newline appended if not already present)
-/// to the running task's stdin, so interactive prompts (e.g. `Connect-
-/// AzAccount`'s tenant/subscription picker, `Read-Host`, a `[Y/n]` confirm)
-/// can be answered from the panel. No-op if nothing is running.
-- (void)sendInputLine:(NSString *)text;
-
 /// Opens a new Terminal window with an interactive `pwsh` session already
 /// running, `cd`'d into `workingDirectory` first. Implemented via a
 /// throwaway `.command` file handed to `/usr/bin/open` (Terminal.app is the
@@ -78,8 +45,10 @@ NS_ASSUME_NONNULL_BEGIN
 + (void)openInteractivePwshInTerminal:(NSString *)pwshPath
                       workingDirectory:(nullable NSString *)workingDirectory;
 
-/// Runs `brew install --cask powershell`. `output`/`completion` behave like
-/// -runScriptAtPath:...; `completion`'s BOOL is YES iff the process exited 0.
+/// Runs `brew install --cask powershell`, streaming combined stdout/stderr
+/// to `output` (main thread, as text arrives) — plain NSPipe is fine here
+/// since this isn't interactive. `completion` (main thread) is called
+/// exactly once with YES iff the process exited 0.
 + (void)installPwshViaHomebrew:(NSString *)brewPath
                           output:(void (^)(NSString *text))output
                       completion:(void (^)(BOOL success))completion;

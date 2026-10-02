@@ -45,10 +45,66 @@ set(RUNPWSH_HDRS
     src/RunPwshLocalization.h
 )
 
+# -----------------------------------------------------------------------------
+# Swift terminal bridge (SwiftTerm) — see swift/RunPwshTerminalBridge/.
+#
+# Since v2.0.0 the panel embeds a real terminal widget (SwiftTerm's
+# LocalProcessTerminalView) instead of a read-only NSTextView + separate
+# input field, so typing happens directly in the console — this was the
+# whole point of that version. SwiftTerm is Swift, and CMake's built-in
+# `enable_language(Swift)` support is unreliable outside Xcode's own
+# generator, so instead of teaching this ObjC++ CMake project to compile
+# Swift itself, the bridge is its own tiny SwiftPM package that we just shell
+# out to `swift build` for, then link the resulting dylib into RunPwsh.dylib
+# like any other pre-built library.
+#
+# Requires the Swift toolchain (ships with Xcode/Command Line Tools) and
+# network access the first time (SwiftPM fetches the SwiftTerm dependency).
+find_program(SWIFT_EXECUTABLE swift REQUIRED)
+find_program(LIPO_EXECUTABLE lipo REQUIRED)
+
+set(RUNPWSH_SWIFT_PKG_DIR "${CMAKE_SOURCE_DIR}/swift/RunPwshTerminalBridge")
+set(RUNPWSH_SWIFT_HEADER_DIR "${RUNPWSH_SWIFT_PKG_DIR}/include")
+
+# `swift build` with no --arch flag only ever builds for the *host*
+# architecture (arm64 on Apple Silicon) — plain single-arch output at
+# .build/release/. That silently mismatched RunPwsh.dylib itself, which
+# CMAKE_OSX_ARCHITECTURES above builds universal (arm64;x86_64): the linker
+# only warned ("ignoring file ... found architecture 'arm64', required
+# architecture 'x86_64'") rather than failing outright, because
+# -undefined,dynamic_lookup (see LINK_FLAGS below) defers symbol resolution
+# — so it built "successfully" while quietly producing an x86_64 slice of
+# RunPwsh.dylib that can never actually find/load its Swift bridge at
+# runtime. Fixed by building each architecture explicitly
+# (`--arch arm64`/`--arch x86_64`, each landing in SwiftPM's own
+# per-triple `.build/<arch>-apple-macosx/release/` directory) and combining
+# them with `lipo` into a genuinely universal dylib ourselves, mirroring
+# what CMAKE_OSX_ARCHITECTURES already does for RunPwsh.dylib.
+set(RUNPWSH_SWIFT_ARM64_DYLIB "${RUNPWSH_SWIFT_PKG_DIR}/.build/arm64-apple-macosx/release/libRunPwshTerminalBridge.dylib")
+set(RUNPWSH_SWIFT_X86_64_DYLIB "${RUNPWSH_SWIFT_PKG_DIR}/.build/x86_64-apple-macosx/release/libRunPwshTerminalBridge.dylib")
+set(RUNPWSH_SWIFT_UNIVERSAL_DIR "${RUNPWSH_SWIFT_PKG_DIR}/.build/universal")
+set(RUNPWSH_SWIFT_DYLIB "${RUNPWSH_SWIFT_UNIVERSAL_DIR}/libRunPwshTerminalBridge.dylib")
+
+# Always invoked (no explicit output-timestamp tracking against the Swift
+# sources) — `swift build` already does its own incremental-build caching,
+# so this just re-asks it every CMake build and it's a fast no-op when
+# nothing changed. Simpler/more robust than trying to mirror SwiftPM's own
+# dependency graph in CMake.
+add_custom_target(RunPwshTerminalBridge_swiftbuild
+    COMMAND "${SWIFT_EXECUTABLE}" build -c release --arch arm64 --package-path "${RUNPWSH_SWIFT_PKG_DIR}"
+    COMMAND "${SWIFT_EXECUTABLE}" build -c release --arch x86_64 --package-path "${RUNPWSH_SWIFT_PKG_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${RUNPWSH_SWIFT_UNIVERSAL_DIR}"
+    COMMAND "${LIPO_EXECUTABLE}" -create -output "${RUNPWSH_SWIFT_DYLIB}" "${RUNPWSH_SWIFT_ARM64_DYLIB}" "${RUNPWSH_SWIFT_X86_64_DYLIB}"
+    BYPRODUCTS "${RUNPWSH_SWIFT_DYLIB}" "${RUNPWSH_SWIFT_HEADER_DIR}/RunPwshTerminalBridge-Swift.h"
+    COMMENT "Building RunPwshTerminalBridge (Swift/SwiftTerm) via SwiftPM for arm64+x86_64, then lipo into a universal dylib"
+    VERBATIM
+)
+
 # MODULE, not SHARED: this is a plugin bundle loaded via dlopen(), never
 # linked against directly, and must not carry an install_name/versioned
 # dylib path the way a real shared library would.
 add_library(RunPwsh MODULE ${RUNPWSH_SRCS} ${RUNPWSH_HDRS})
+add_dependencies(RunPwsh RunPwshTerminalBridge_swiftbuild)
 
 set_target_properties(RunPwsh PROPERTIES
     OUTPUT_NAME "RunPwsh"
@@ -60,6 +116,7 @@ set_target_properties(RunPwsh PROPERTIES
 target_include_directories(RunPwsh PRIVATE
     "${CMAKE_SOURCE_DIR}/vendor"
     "${CMAKE_SOURCE_DIR}/src"
+    "${RUNPWSH_SWIFT_HEADER_DIR}"
 )
 
 target_compile_options(RunPwsh PRIVATE -fobjc-arc -Wall -Wextra)
@@ -67,11 +124,18 @@ target_compile_options(RunPwsh PRIVATE -fobjc-arc -Wall -Wextra)
 target_link_libraries(RunPwsh PRIVATE
     "-framework Cocoa"
     "-framework Foundation"
+    "${RUNPWSH_SWIFT_DYLIB}"
 )
 
-# Plugins are dlopen()'d, not linked against a fixed absolute path.
+# Plugins are dlopen()'d, not linked against a fixed absolute path — but
+# RunPwsh.dylib itself now links directly against libRunPwshTerminalBridge.dylib
+# (a real dependency, unlike the host app itself, which is why
+# -undefined,dynamic_lookup alone isn't enough here: that flag only defers
+# *host-provided* symbols, it doesn't help RunPwsh.dylib find a sibling
+# library at runtime). @loader_path makes it look next to itself, where
+# install_plugin below copies libRunPwshTerminalBridge.dylib to.
 set_target_properties(RunPwsh PROPERTIES
-    LINK_FLAGS "-Wl,-undefined,dynamic_lookup"
+    LINK_FLAGS "-Wl,-undefined,dynamic_lookup -Wl,-rpath,@loader_path"
 )
 
 # -----------------------------------------------------------------------------
@@ -85,7 +149,9 @@ set(NPP_PLUGINS_DIR "$ENV{HOME}/Library/Application Support/Nextpad++/plugins")
 add_custom_target(install_plugin
     COMMAND ${CMAKE_COMMAND} -E make_directory "${NPP_PLUGINS_DIR}/RunPwsh"
     COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:RunPwsh>" "${NPP_PLUGINS_DIR}/RunPwsh/RunPwsh.dylib"
+    # Sits next to RunPwsh.dylib so the @loader_path rpath set above finds it.
+    COMMAND ${CMAKE_COMMAND} -E copy "${RUNPWSH_SWIFT_DYLIB}" "${NPP_PLUGINS_DIR}/RunPwsh/libRunPwshTerminalBridge.dylib"
     COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/resources" "${NPP_PLUGINS_DIR}/RunPwsh/resources"
     DEPENDS RunPwsh
-    COMMENT "Installing RunPwsh.dylib and toolbar icons into ${NPP_PLUGINS_DIR}/RunPwsh/"
+    COMMENT "Installing RunPwsh.dylib, libRunPwshTerminalBridge.dylib and toolbar icons into ${NPP_PLUGINS_DIR}/RunPwsh/"
 )
