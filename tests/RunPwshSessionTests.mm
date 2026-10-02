@@ -286,7 +286,7 @@ static void testTerminateThenDrainDoesNotRespawn(void) {
 static void testInitCommandGivesPredictionAnExplicitGreyColor(void) {
     NSString *c = [RunPwshSession initCommand];
     CHECK([c containsString:@"InlinePrediction"]);
-    CHECK([c containsString:@"38;5;244"]);
+    CHECK([c containsString:@"38;5;238"]);
 }
 
 int main(void) {
