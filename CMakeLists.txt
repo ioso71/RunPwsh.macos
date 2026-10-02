@@ -37,6 +37,7 @@ set(RUNPWSH_SRCS
     src/RunPwshEngine.mm
     src/RunPwshLocalization.mm
     src/RunPwshSession.mm
+    src/RunPwshPreferences.mm
 )
 
 set(RUNPWSH_HDRS
@@ -45,6 +46,7 @@ set(RUNPWSH_HDRS
     src/RunPwshEngine.h
     src/RunPwshLocalization.h
     src/RunPwshSession.h
+    src/RunPwshPreferences.h
 )
 
 # -----------------------------------------------------------------------------
@@ -171,6 +173,7 @@ add_custom_target(install_plugin
 add_executable(runpwsh_session_tests EXCLUDE_FROM_ALL
     tests/RunPwshSessionTests.mm
     src/RunPwshSession.mm
+    src/RunPwshPreferences.mm
 )
 target_include_directories(runpwsh_session_tests PRIVATE "${CMAKE_SOURCE_DIR}/src")
 target_compile_options(runpwsh_session_tests PRIVATE -fobjc-arc -Wall -Wextra)

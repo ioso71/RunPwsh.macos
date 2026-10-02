@@ -13,6 +13,12 @@ Session rewrite, modelled on the PowerShell terminal of VS Code's PowerShell
 extension.
 
 ### Added
+- **The panel's open/closed state is remembered** (`runpwsh-plugin-prefs.json`
+  in the plugin config folder, key `panelWasVisible`). On first launch the
+  panel stays closed; afterwards it is reopened only if it was open when you
+  last changed it. Closing it with the panel's X button is remembered too
+  (via the host's `panelWillClose` callback, which is not part of the
+  documented plugin API). While the panel is closed no `pwsh` process runs.
 - `pwsh` now **starts as soon as the panel is shown**: the banner and the
   `PS <path>>` prompt appear without clicking Run, and the terminal takes
   keyboard focus.

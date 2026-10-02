@@ -65,6 +65,7 @@ RunPwsh/
     │                            Restart Session),
     │                            install-via-Homebrew banner, embedded
     │                            terminal (RunPwshTerminalBridge)
+    ├── RunPwshPreferences.h/.mm Remembers whether the panel was open (JSON file)
     ├── RunPwshSession.h/.mm     Session state machine (Idle → Starting → Ready
     │                            ⇄ Running → Ended); "ready" = pwsh printed a prompt
     ├── RunPwshEngine.h/.mm      pwsh/brew discovery,
@@ -159,6 +160,12 @@ a single queue slot and are sent at the next prompt; there are no timers.
   **Restart Session** starts a new one.
 - All commands are also in the editor's right-click menu under
   **Plugin Commands → RunPwsh**.
+- **Open/closed state is remembered.** The panel is not opened on its own at
+  first launch; open it with the toolbar button or **Plugins → RunPwsh →
+  Toggle RunPwsh Panel**. From then on it comes back the way you left it
+  (open stays open, closed stays closed, including closing it with the
+  panel's X). No `pwsh` runs while the panel is closed. The state is kept in
+  `runpwsh-plugin-prefs.json` in the plugin config folder.
 - **Keyboard shortcuts:** the host ignores shortcuts proposed by plugins.
   Assign F5 / F8 (or any key) yourself under **Edit → Shortcut Mapper… →
   Plugins**.

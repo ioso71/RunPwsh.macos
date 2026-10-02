@@ -17,6 +17,12 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)runPwshPanelViewDidRequestRestart:(RunPwshPanelView *)view;
 - (void)runPwshPanelViewDidRequestInstallPwsh:(RunPwshPanelView *)view;
 
+/// The host is hiding the panel — by the panel's own X button, the Toggle
+/// command or NPPM_DMM_HIDEPANEL alike. The host calls -panelWillClose on the
+/// panel view for every hide (informal selector, see MainWindowController.mm
+/// -_setPanelVisible:title:show:), which is the only hook for the X button.
+- (void)runPwshPanelViewWillClose:(RunPwshPanelView *)view;
+
 @end
 
 /// Panel with a small toolbar (Run Script / Run Selection / Stop / Restart

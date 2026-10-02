@@ -29,6 +29,7 @@
 #import "RunPwshPanelView.h"
 #import "RunPwshEngine.h"
 #import "RunPwshLocalization.h"
+#import "RunPwshPreferences.h"
 
 /* ─────────────────────────────────────────────────────────────────────────
  * SCNotification — minimal local mirror (same rationale as FinderPlugin.mm:
@@ -100,6 +101,7 @@ static NSMenuItem *FindMenuItemWithTag(NSMenu *menu, NSInteger tag) {
 - (void)handleBeforeShutdown;
 - (void)togglePanel;
 - (void)startSessionIfNeeded;
+- (void)rememberPanelVisible:(BOOL)visible;
 - (void)runScriptAction;
 - (void)runSelectionAction;
 - (void)stopAction;
@@ -111,6 +113,8 @@ static NSMenuItem *FindMenuItemWithTag(NSMenu *menu, NSInteger tag) {
     RunPwshPanelView *_panelView;
     uintptr_t _panelHandle;
     BOOL _panelVisible;
+    RunPwshPreferences *_prefs;     // remembers whether the panel was open
+    BOOL _shuttingDown;             // the host hides panels on quit; that must not be saved as "closed"
     NSString *_cachedPwshPath;   // nil means "checked and not found"; re-probed each time the panel becomes visible/before a run
     BOOL _pwshChecked;
 }
@@ -188,6 +192,13 @@ static NSMenuItem *FindMenuItemWithTag(NSMenu *menu, NSInteger tag) {
 - (void)ensurePanelCreated {
     if (_panelView) return;
 
+    if (!_prefs) {
+        char configBuf[1024] = {0};
+        nppData._sendMessage(nppData._nppHandle, NPPM_GETPLUGINSCONFIGDIR, 1024, (intptr_t)configBuf);
+        _prefs = [[RunPwshPreferences alloc] initWithConfigDirectory:
+            configBuf[0] ? [NSString stringWithUTF8String:configBuf] : @""];
+    }
+
     _panelView = [[RunPwshPanelView alloc] initWithFrame:NSMakeRect(0, 0, 320, 260)];
     _panelView.delegate = self;
 
@@ -212,6 +223,10 @@ static NSMenuItem *FindMenuItemWithTag(NSMenu *menu, NSInteger tag) {
 
     if (!_panelHandle) return;
 
+    // The panel is only reopened if it was open when the user last changed
+    // it; a closed panel stays closed, and no pwsh is started for it.
+    if (!_prefs.panelWasVisible) return;
+
     // Deferred by one runloop tick: see FinderPlugin.mm's -handleReady for
     // the exact race this avoids (NPPN_READY firing before the main
     // window's split-view geometry has settled on first launch).
@@ -235,6 +250,7 @@ static NSMenuItem *FindMenuItemWithTag(NSMenu *menu, NSInteger tag) {
 }
 
 - (void)handleBeforeShutdown {
+    _shuttingDown = YES;   // the host may hide the panel while quitting; keep the saved state
     [_panelView terminateSession];
     if (_panelHandle) {
         nppData._sendMessage(nppData._nppHandle, NPPM_DMM_UNREGISTERPANEL, _panelHandle, 0);
@@ -254,6 +270,21 @@ static NSMenuItem *FindMenuItemWithTag(NSMenu *menu, NSInteger tag) {
         [_panelView focusTerminal];
     }
     _panelVisible = !_panelVisible;
+    [self rememberPanelVisible:_panelVisible];
+}
+
+/// Persists the panel state right away (not only at quit), so a crash or a
+/// forced quit cannot lose it.
+- (void)rememberPanelVisible:(BOOL)visible {
+    if (_shuttingDown) return;
+    [_prefs setPanelWasVisible:visible];
+}
+
+/// The host hides the panel (X button, Toggle, NPPM_DMM_HIDEPANEL).
+- (void)runPwshPanelViewWillClose:(RunPwshPanelView *)view {
+    (void)view;
+    _panelVisible = NO;           // also fixes the drift after the X button
+    [self rememberPanelVisible:NO];
 }
 
 /// Ensures the panel is created + visible, e.g. before showing run output —
@@ -264,6 +295,7 @@ static NSMenuItem *FindMenuItemWithTag(NSMenu *menu, NSInteger tag) {
     if (_panelHandle && !_panelVisible) {
         nppData._sendMessage(nppData._nppHandle, NPPM_DMM_SHOWPANEL, _panelHandle, 0);
         _panelVisible = YES;
+        [self rememberPanelVisible:YES];
         [_panelView focusTerminal];
     }
     [self startSessionIfNeeded];
@@ -368,6 +400,7 @@ static NSString *RunPwshEscapeSingleQuoted(NSString *path) {
     if (_panelHandle && !_panelVisible) {
         nppData._sendMessage(nppData._nppHandle, NPPM_DMM_SHOWPANEL, _panelHandle, 0);
         _panelVisible = YES;
+        [self rememberPanelVisible:YES];
     }
     if (_panelView.sessionAlive) {
         [_panelView restartSession];

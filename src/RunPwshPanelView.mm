@@ -281,6 +281,13 @@
     [self setNeedsLayout:YES];
 }
 
+/// Called by the host (informal selector) each time it hides this panel.
+- (void)panelWillClose {
+    if ([self.delegate respondsToSelector:@selector(runPwshPanelViewWillClose:)]) {
+        [self.delegate runPwshPanelViewWillClose:self];
+    }
+}
+
 - (void)setStatusText:(NSString *)text {
     _statusLabel.stringValue = text ?: @"";
 }

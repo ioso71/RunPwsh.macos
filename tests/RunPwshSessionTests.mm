@@ -2,6 +2,7 @@
 //   cmake --build build --target run_session_tests
 #import <Foundation/Foundation.h>
 #import "RunPwshSession.h"
+#import "RunPwshPreferences.h"
 
 @interface FakeTransport : NSObject <RunPwshSessionTransport>
 @property (nonatomic, copy, nullable) void (^onPrompt)(void);
@@ -289,6 +290,69 @@ static void testInitCommandGivesPredictionAnExplicitGreyColor(void) {
     CHECK([c containsString:@"38;5;238"]);
 }
 
+// ---- RunPwshPreferences: remember whether the panel was open ----
+
+static NSString *TempDir(void) {
+    NSString *d = [NSTemporaryDirectory() stringByAppendingPathComponent:
+        [@"runpwsh-prefs-" stringByAppendingString:NSUUID.UUID.UUIDString]];
+    return d;   // not created on purpose: the store must create it
+}
+
+static void testPrefsDefaultIsClosed(void) {
+    RunPwshPreferences *p = [[RunPwshPreferences alloc] initWithConfigDirectory:TempDir()];
+    CHECK(!p.panelWasVisible);
+}
+
+static void testPrefsRoundTrip(void) {
+    NSString *dir = TempDir();
+    RunPwshPreferences *a = [[RunPwshPreferences alloc] initWithConfigDirectory:dir];
+    [a setPanelWasVisible:YES];
+    RunPwshPreferences *b = [[RunPwshPreferences alloc] initWithConfigDirectory:dir];
+    CHECK(b.panelWasVisible);
+    [b setPanelWasVisible:NO];
+    RunPwshPreferences *c = [[RunPwshPreferences alloc] initWithConfigDirectory:dir];
+    CHECK(!c.panelWasVisible);
+}
+
+static void testPrefsCreatesMissingDirectory(void) {
+    NSString *dir = [TempDir() stringByAppendingPathComponent:@"nested/deeper"];
+    RunPwshPreferences *p = [[RunPwshPreferences alloc] initWithConfigDirectory:dir];
+    [p setPanelWasVisible:YES];
+    BOOL isDir = NO;
+    CHECK([[NSFileManager defaultManager] fileExistsAtPath:dir isDirectory:&isDir] && isDir);
+}
+
+static void testPrefsCorruptFileFallsBackToDefault(void) {
+    NSString *dir = TempDir();
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    [@"{ not json" writeToFile:[dir stringByAppendingPathComponent:@"runpwsh-plugin-prefs.json"]
+                    atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    RunPwshPreferences *p = [[RunPwshPreferences alloc] initWithConfigDirectory:dir];
+    CHECK(!p.panelWasVisible);
+    [p setPanelWasVisible:YES];                 // and it recovers by overwriting
+    CHECK([[RunPwshPreferences alloc] initWithConfigDirectory:dir].panelWasVisible);
+}
+
+static void testPrefsWrongTypeIsIgnored(void) {
+    NSString *dir = TempDir();
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    [@"{\"panelWasVisible\": \"yes\"}" writeToFile:[dir stringByAppendingPathComponent:@"runpwsh-plugin-prefs.json"]
+                                       atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    CHECK(![[RunPwshPreferences alloc] initWithConfigDirectory:dir].panelWasVisible);
+}
+
+static void testPrefsKeepsUnknownKeys(void) {
+    NSString *dir = TempDir();
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *file = [dir stringByAppendingPathComponent:@"runpwsh-plugin-prefs.json"];
+    [@"{\"somethingNew\": 7}" writeToFile:file atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    RunPwshPreferences *p = [[RunPwshPreferences alloc] initWithConfigDirectory:dir];
+    [p setPanelWasVisible:YES];
+    NSDictionary *d = [NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:file] options:0 error:nil];
+    CHECK([d[@"somethingNew"] intValue] == 7);     // a newer plugin version's key survives a downgrade write
+    CHECK([d[@"panelWasVisible"] boolValue]);
+}
+
 int main(void) {
     @autoreleasepool {
         testStartPassesInitCommandAndHome();
@@ -314,6 +378,12 @@ int main(void) {
         testTabsBecomeSpaces();
         testTerminateThenDrainDoesNotRespawn();
         testInitCommandGivesPredictionAnExplicitGreyColor();
+        testPrefsDefaultIsClosed();
+        testPrefsRoundTrip();
+        testPrefsCreatesMissingDirectory();
+        testPrefsCorruptFileFallsBackToDefault();
+        testPrefsWrongTypeIsIgnored();
+        testPrefsKeepsUnknownKeys();
     }
     if (gFailures) { fprintf(stderr, "%d check(s) failed\n", gFailures); return 1; }
     printf("All session tests passed\n");
