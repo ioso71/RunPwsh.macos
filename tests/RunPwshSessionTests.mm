@@ -281,6 +281,14 @@ static void testTerminateThenDrainDoesNotRespawn(void) {
     CHECK(s.state == RunPwshSessionStateEnded);
 }
 
+// #2 of the manual checklist: SwiftTerm's Mac view does not draw the "dim" attribute,
+// so PSReadLine's inline prediction (dim+italic) looked like real, undeletable text.
+static void testInitCommandGivesPredictionAnExplicitGreyColor(void) {
+    NSString *c = [RunPwshSession initCommand];
+    CHECK([c containsString:@"InlinePrediction"]);
+    CHECK([c containsString:@"38;5;244"]);
+}
+
 int main(void) {
     @autoreleasepool {
         testStartPassesInitCommandAndHome();
@@ -305,6 +313,7 @@ int main(void) {
         testInterruptWhileStartingDropsQueue();
         testTabsBecomeSpaces();
         testTerminateThenDrainDoesNotRespawn();
+        testInitCommandGivesPredictionAnExplicitGreyColor();
     }
     if (gFailures) { fprintf(stderr, "%d check(s) failed\n", gFailures); return 1; }
     printf("All session tests passed\n");

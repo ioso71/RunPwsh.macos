@@ -40,6 +40,10 @@ extension.
 - `pwsh` could not find external programs (`ping`, `git`, …): SwiftTerm 1.2.0
   leaves `PATH` out of the child environment. The bridge now passes the
   host's environment on top of SwiftTerm's defaults.
+- PSReadLine's inline prediction (the grey suggestion after what you typed)
+  looked like real text that Backspace could not delete: SwiftTerm's macOS
+  view does not draw the "dim" attribute PSReadLine uses by default. The
+  session now sets an explicit grey (`InlinePrediction` = `ESC[38;5;244m`).
 - Restart Session now works: the new process is started on the next run-loop
   turn, because SwiftTerm only clears its `running` flag after the exit
   callback returns (starting from inside it was silently ignored). A Run

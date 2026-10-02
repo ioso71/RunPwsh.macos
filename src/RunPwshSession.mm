@@ -12,9 +12,14 @@
 + (NSString *)initCommand {
     // Overrides `prompt`: emit OSC 7 first (SwiftTerm reports it through
     // hostCurrentDirectoryUpdate), then the normal "PS <path>> " text.
+    // Second statement: SwiftTerm's macOS view does not draw the "dim"
+    // attribute, so PSReadLine's default inline prediction colour
+    // (ESC[97;2;3m = bright white, dim, italic) renders as solid white text
+    // that looks real but cannot be deleted. Give it an explicit grey.
     return @"function global:prompt { $e=[char]27; $b=[char]7; "
            @"$p=(Get-Location).ProviderPath; "
-           @"[Console]::Write(\"$e]7;file://localhost$p$b\"); \"PS $p> \" }";
+           @"[Console]::Write(\"$e]7;file://localhost$p$b\"); \"PS $p> \" }; "
+           @"Set-PSReadLineOption -Colors @{ InlinePrediction = \"$([char]27)[38;5;244m\" }";
 }
 
 - (instancetype)initWithTransport:(id<RunPwshSessionTransport>)transport {
