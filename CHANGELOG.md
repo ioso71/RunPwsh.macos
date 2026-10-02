@@ -7,6 +7,50 @@ Version scheme: `XX.Y.ZZ` (Major.Minor.Patch)
 - **Y** (Minor): medium updates / new features
 - **XX** (Major): large breaking changes
 
+## [4.0.0] — 2026-10-02
+
+Session rewrite, modelled on the PowerShell terminal of VS Code's PowerShell
+extension.
+
+### Added
+- `pwsh` now **starts as soon as the panel is shown**: the banner and the
+  `PS <path>>` prompt appear without clicking Run, and the terminal takes
+  keyboard focus.
+- `RunPwshSession` (`src/RunPwshSession.*`): an explicit session state machine
+  (`Idle → Starting → Ready ⇄ Running → Ended`) with unit tests
+  (`cmake --build build --target run_session_tests`).
+- The session starts `pwsh` with a `prompt` override that emits OSC 7 before
+  every prompt; the Swift bridge forwards it as `onPrompt`. "Ready" now means
+  "pwsh printed a prompt".
+- A Run requested while `pwsh` is still starting, or while another command is
+  running, is queued in one slot (a newer request replaces an older one) and
+  sent at the next prompt.
+- Clicking the terminal gives it keyboard focus (`focus()` in the bridge).
+
+### Fixed
+- Keyboard input (Backspace, Enter, …) did nothing in the terminal: SwiftTerm
+  1.2.0 never made its view first responder on click.
+- The first Run against a fresh session typed its text twice (before and after
+  the prompt) and could stay un-submitted. Caused by the 0.6 s / 1.5 s
+  timers of 3.1.2 – 3.1.4, which are gone.
+- The Swift bridge's Obj-C header was no longer regenerated with Swift 6.4's
+  default build system, hiding new `@objc` members from the `.mm` files. The
+  CMake target now builds the bridge with `--build-system native`.
+
+### Removed (breaking)
+- **"Start Pwsh in Terminal"** (menu command and toolbar button). The menu now
+  has 5 commands instead of 6; command IDs after "Stop" shifted, so custom
+  shortcuts assigned to the later commands may need to be set again under
+  Edit → Shortcut Mapper… → Plugins.
+- The startup grace period, the extra follow-up Enter and
+  `ensureSessionStarted…completion:`.
+
+### Changed
+- "New Session" is now **Restart Session**: it ends the process and starts a
+  new one in one step.
+- After `exit` or a crash the terminal shows "Session ended" and Restart
+  Session starts a new session.
+
 ## [3.1.5] — 2026-08-31
 
 ### Fixed

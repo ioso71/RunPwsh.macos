@@ -1,8 +1,8 @@
 /*
  * RunPwshPlugin.mm — plugin entry point for the Nextpad++ macOS "RunPwsh"
- * plugin: a PowerShell-ISE-like panel (Run Script / Run Selection / Stop /
- * Open in Terminal, plus an install-via-Homebrew banner when `pwsh` isn't
- * found) built on the RunPwshEngine (process execution) and RunPwshPanelView
+ * plugin: a PowerShell terminal panel modelled on VS Code's PowerShell
+ * extension (Run Script / Run Selection / Stop / Restart Session, plus an
+ * install-via-Homebrew banner when `pwsh` isn't found) built on the RunPwshEngine (process execution) and RunPwshPanelView
  * (UI) helpers in this same directory.
  *
  * This file owns the 5 mandatory C exports (setInfo, getName,
@@ -12,13 +12,14 @@
  *
  * ─────────────────────────────────────────────────────────────────────────
  * VERSION — single source of truth for this plugin's version number.
- * On every change, bump this AND the version line in README.md, and add
- * an entry to CHANGELOG.md:
+ * On every change, bump this, `project(RunPwsh VERSION …)` in
+ * CMakeLists.txt AND the version line in README.md, and add an entry to
+ * CHANGELOG.md:
  *   - Bugfix / small change   → patch (ZZ):  1.1.0 → 1.1.1
  *   - Feature / medium change → minor (Y):   1.0.10 → 1.1.0
  *   - Breaking change         → major (XX):  1.9.0 → 2.0.0
  * ───────────────────────────────────────────────────────────────────────── */
-#define RUNPWSH_PLUGIN_VERSION "3.1.5"
+#define RUNPWSH_PLUGIN_VERSION "4.0.0"
 
 #import <Cocoa/Cocoa.h>
 #include <string.h>
@@ -62,7 +63,7 @@ NppData nppData;
 /* ─────────────────────────────────────────────────────────────────────────
  * Menu command table.
  * ───────────────────────────────────────────────────────────────────────── */
-#define RUNPWSH_FUNC_COUNT 6
+#define RUNPWSH_FUNC_COUNT 5
 static FuncItem gFuncItems[RUNPWSH_FUNC_COUNT];
 
 static NSString *LocalizedFuncItemName(int idx) {
@@ -71,8 +72,7 @@ static NSString *LocalizedFuncItemName(int idx) {
         case 1: return RPLoc(@"Script ausführen", @"Run Script");
         case 2: return RPLoc(@"Auswahl ausführen", @"Run Selection");
         case 3: return RPLoc(@"Aktuellen Befehl abbrechen", @"Interrupt current command");
-        case 4: return RPLoc(@"Pwsh in Terminal starten", @"Start Pwsh in Terminal");
-        case 5: return RPLoc(@"Neue Sitzung starten", @"Start New Session");
+        case 4: return RPLoc(@"Sitzung neu starten", @"Restart Session");
         default: return @"";
     }
 }
@@ -99,11 +99,11 @@ static NSMenuItem *FindMenuItemWithTag(NSMenu *menu, NSInteger tag) {
 - (void)handleReady;
 - (void)handleBeforeShutdown;
 - (void)togglePanel;
+- (void)startSessionIfNeeded;
 - (void)runScriptAction;
 - (void)runSelectionAction;
 - (void)stopAction;
-- (void)newSessionAction;
-- (void)openTerminalAction;
+- (void)restartAction;
 - (void)relocalizeMenuItems;
 @end
 
@@ -218,6 +218,10 @@ static NSMenuItem *FindMenuItemWithTag(NSMenu *menu, NSInteger tag) {
     dispatch_async(dispatch_get_main_queue(), ^{
         intptr_t result = nppData._sendMessage(nppData._nppHandle, NPPM_DMM_SHOWPANEL, self->_panelHandle, 0);
         self->_panelVisible = (result != 0);
+        if (self->_panelVisible) {
+            [self startSessionIfNeeded];
+            [self->_panelView focusTerminal];
+        }
     });
 }
 
@@ -231,7 +235,7 @@ static NSMenuItem *FindMenuItemWithTag(NSMenu *menu, NSInteger tag) {
 }
 
 - (void)handleBeforeShutdown {
-    [_panelView killSession];
+    [_panelView terminateSession];
     if (_panelHandle) {
         nppData._sendMessage(nppData._nppHandle, NPPM_DMM_UNREGISTERPANEL, _panelHandle, 0);
         _panelHandle = 0;
@@ -246,7 +250,8 @@ static NSMenuItem *FindMenuItemWithTag(NSMenu *menu, NSInteger tag) {
         nppData._sendMessage(nppData._nppHandle, NPPM_DMM_HIDEPANEL, _panelHandle, 0);
     } else {
         nppData._sendMessage(nppData._nppHandle, NPPM_DMM_SHOWPANEL, _panelHandle, 0);
-        [self refreshPwshStatus];
+        [self startSessionIfNeeded];
+        [_panelView focusTerminal];
     }
     _panelVisible = !_panelVisible;
 }
@@ -259,7 +264,18 @@ static NSMenuItem *FindMenuItemWithTag(NSMenu *menu, NSInteger tag) {
     if (_panelHandle && !_panelVisible) {
         nppData._sendMessage(nppData._nppHandle, NPPM_DMM_SHOWPANEL, _panelHandle, 0);
         _panelVisible = YES;
+        [_panelView focusTerminal];
     }
+    [self startSessionIfNeeded];
+}
+
+/// Starts pwsh as soon as the panel is visible (unless it is already alive
+/// or pwsh is missing — then the install banner is shown instead).
+- (void)startSessionIfNeeded {
+    [self refreshPwshStatus];
+    if (!_cachedPwshPath) return;
+    if (_panelView.sessionAlive) return;
+    [_panelView startSessionWithExecutable:_cachedPwshPath];
 }
 
 #pragma mark - pwsh / brew detection
@@ -297,43 +313,14 @@ static NSString *RunPwshEscapeSingleQuoted(NSString *path) {
     return [path stringByReplacingOccurrencesOfString:@"'" withString:@"''"];
 }
 
-/// Starts the persistent interactive session (a no-op beyond calling
-/// `completion` right away if one is already running — see
-/// -ensureSessionStartedWithExecutable:...) so "Run Script"/"Run Selection"
-/// always have something to type into. Every fresh interactive session starts
-/// in the user's home directory (`~` / `/Users/<user>`), independent of the
-/// active editor document. Call sites that need a different working directory
-/// explicitly prepend their own `Set-Location` command (see -runScriptAction
-/// below), so a script can still use paths relative to its own folder.
-///
-/// `completion` is only called once it's actually safe to -runText: (see
-/// that method's doc comment) — callers must run their -runText: call
-/// *inside* it, not right after this method returns (v3.1.2 fix for a
-/// "typed but never executed" race against pwsh's own startup).
-- (void)ensureSessionReadyWithCwd:(nullable NSString *)cwd completion:(void (^)(void))completion {
-    NSString *pwsh = [RunPwshEngine findPwshPath];
-    if (!pwsh) return;
-    [_panelView ensureSessionStartedWithExecutable:pwsh
-                                          arguments:@[@"-NoLogo", @"-NoProfile", @"-ExecutionPolicy", @"Bypass"]
-                                   currentDirectory:NSHomeDirectory()
-                                         completion:completion];
-}
-
 - (void)runScriptAction {
     [self ensurePanelShown];
-
-    NSString *pwsh = [RunPwshEngine findPwshPath];
-    if (!pwsh) {
-        [self refreshPwshStatus];
-        return;
-    }
+    if (!_cachedPwshPath) { [self refreshPwshStatus]; return; }
 
     // Auto-save first (matches PowerShell ISE's F5 behavior): the executed
-    // .ps1 should always reflect what's currently in the editor, not the
-    // last manually-saved state. On an untitled/never-saved buffer this
-    // triggers the host's own Save As dialog; if the user cancels it,
-    // NPPM_GETFULLCURRENTPATH below still comes back empty and we report
-    // that instead of trying to run nothing.
+    // .ps1 should always reflect what's currently in the editor. On an
+    // untitled buffer this triggers the host's Save As dialog; if the user
+    // cancels it, the path below still comes back empty.
     nppData._sendMessage(nppData._nppHandle, NPPM_SAVECURRENTFILE, 0, 0);
 
     NSString *path = [self currentFilePath];
@@ -346,86 +333,40 @@ static NSString *RunPwshEscapeSingleQuoted(NSString *path) {
 
     // Dot-sourced (". 'path'"), not "& 'path'": a plain call would run the
     // script in its own child scope, so variables/functions it defines
-    // wouldn't stick around in the session afterwards — dot-sourcing runs it
-    // directly in the session's own scope instead, which is the whole point
-    // of the persistent-session model (v3.0.0). `Set-Location` first so this
-    // still works correctly even if the session was started from a
-    // different file's folder on an earlier run.
-    NSString *command = [NSString stringWithFormat:@"Set-Location -LiteralPath '%@'; . '%@'\n",
+    // would not survive in the session. `Set-Location` first so relative
+    // paths inside the script resolve against the script's own folder.
+    NSString *command = [NSString stringWithFormat:@"Set-Location -LiteralPath '%@'; . '%@'",
         RunPwshEscapeSingleQuoted(cwd), RunPwshEscapeSingleQuoted(path)];
-
-    // runText: must not fire until the session is actually ready to read
-    // input (v3.1.2 fix) — see -ensureSessionReadyWithCwd:completion:'s doc
-    // comment. RunPwshPanelView *(__weak)* isn't needed here: _panelView is
-    // this controller's own ivar and outlives any single button click.
-    __weak typeof(_panelView) weakPanelView = _panelView;
-    [self ensureSessionReadyWithCwd:cwd completion:^{
-        [weakPanelView runText:command];
-    }];
+    [_panelView runText:command];
 }
 
 - (void)runSelectionAction {
     [self ensurePanelShown];
+    if (!_cachedPwshPath) { [self refreshPwshStatus]; return; }
 
-    NSString *pwsh = [RunPwshEngine findPwshPath];
-    if (!pwsh) {
-        [self refreshPwshStatus];
-        return;
-    }
-
-    // Falls back to the current line if there's no selection (v3.1.0) —
-    // matching the real PowerShell ISE's F8 behavior: just clicking the
-    // cursor into a line and pressing "Auswahl ausführen"/Run Selection runs
-    // that line, instead of printing "no selection" and doing nothing (user
-    // report, 2026-08-28).
+    // Falls back to the current line if there is no selection (VS Code F8 /
+    // PowerShell ISE behavior).
     NSString *toRun = [self currentSelectionText] ?: [self currentLineText];
     if (!toRun) {
         [_panelView feedText:RPLoc(@"Keine Auswahl und keine aktuelle Zeile vorhanden.\n", @"No selection and no current line.\n")];
         return;
     }
-
-    NSString *path = [self currentFilePath];
-    NSString *cwd = path ? [path stringByDeletingLastPathComponent] : NSHomeDirectory();
-
-    // Typed straight into the session, verbatim — same as the user manually
-    // copy/pasting it into a terminal (no temp .ps1 file anymore: since
-    // v3.0.0 there's no separate throwaway process to give it real line
-    // numbers for, and this way it's typed into whatever scope/session state
-    // is already active, which is the entire point). Deferred to
-    // -ensureSessionReadyWithCwd:completion:'s completion block (v3.1.2) so
-    // this doesn't race a freshly-spawned session's own startup — see that
-    // method's doc comment for the exact "typed twice, never executed"
-    // symptom this fixes.
-    __weak typeof(_panelView) weakPanelView = _panelView;
-    [self ensureSessionReadyWithCwd:cwd completion:^{
-        [weakPanelView runText:toRun];
-    }];
+    [_panelView runText:toRun];
 }
 
 - (void)stopAction {
     [_panelView interruptSession];
 }
 
-- (void)newSessionAction {
-    [_panelView killSession];
-}
-
-- (void)openTerminalAction {
-    NSString *pwsh = [RunPwshEngine findPwshPath];
-    if (!pwsh) {
-        [self ensurePanelShown];
-        [self refreshPwshStatus];
-        return;
-    }
-    NSString *path = [self currentFilePath];
-    NSString *cwd = path ? [path stringByDeletingLastPathComponent] : NSHomeDirectory();
-    [RunPwshEngine openInteractivePwshInTerminal:pwsh workingDirectory:cwd];
+- (void)restartAction {
+    [self ensurePanelShown];
+    [_panelView restartSession];
 }
 
 - (void)installPwshAction {
     NSString *brew = [RunPwshEngine findBrewPath];
     if (!brew) return; // banner already reflects "install Homebrew manually" in this case
-    if (_panelView.hasSession) return;
+    if (_panelView.sessionAlive) return;
     [_panelView feedText:RPLoc(@"Installiere PowerShell via Homebrew…\n", @"Installing PowerShell via Homebrew…\n")];
     [_panelView setSessionActive:YES];
     __weak RunPwshPluginController *weakSelf = self;
@@ -442,6 +383,7 @@ static NSString *RunPwshEscapeSingleQuoted(NSString *path) {
             ? RPLoc(@"\nInstallation abgeschlossen.\n", @"\nInstallation finished.\n")
             : RPLoc(@"\nInstallation fehlgeschlagen.\n", @"\nInstallation failed.\n")];
         [strongSelf refreshPwshStatus];
+        if (success) [strongSelf startSessionIfNeeded];
     }];
 }
 
@@ -450,18 +392,9 @@ static NSString *RunPwshEscapeSingleQuoted(NSString *path) {
 - (void)runPwshPanelViewDidRequestRunScript:(RunPwshPanelView *)view { (void)view; [self runScriptAction]; }
 - (void)runPwshPanelViewDidRequestRunSelection:(RunPwshPanelView *)view { (void)view; [self runSelectionAction]; }
 - (void)runPwshPanelViewDidRequestStop:(RunPwshPanelView *)view { (void)view; [self stopAction]; }
-- (void)runPwshPanelViewDidRequestNewSession:(RunPwshPanelView *)view { (void)view; [self newSessionAction]; }
-- (void)runPwshPanelViewDidRequestOpenTerminal:(RunPwshPanelView *)view { (void)view; [self openTerminalAction]; }
+- (void)runPwshPanelViewDidRequestRestart:(RunPwshPanelView *)view { (void)view; [self restartAction]; }
 - (void)runPwshPanelViewDidRequestInstallPwsh:(RunPwshPanelView *)view { (void)view; [self installPwshAction]; }
 
-- (void)runPwshPanelViewProcessDidExit:(RunPwshPanelView *)view exitCode:(int32_t)exitCode {
-    // Nothing to clean up here anymore as of v3.0.0 (no more per-run temp
-    // .ps1 files — see -runSelectionAction) — kept as a no-op override
-    // purely so future cleanup needs have an obvious place to go, mirroring
-    // this delegate method's optional status in RunPwshPanelView.h.
-    (void)view;
-    (void)exitCode;
-}
 
 @end
 
@@ -473,8 +406,7 @@ static void Cmd_TogglePanel(void)    { [[RunPwshPluginController shared] toggleP
 static void Cmd_RunScript(void)      { [[RunPwshPluginController shared] runScriptAction]; }
 static void Cmd_RunSelection(void)   { [[RunPwshPluginController shared] runSelectionAction]; }
 static void Cmd_Stop(void)           { [[RunPwshPluginController shared] stopAction]; }
-static void Cmd_OpenTerminal(void)   { [[RunPwshPluginController shared] openTerminalAction]; }
-static void Cmd_NewSession(void)     { [[RunPwshPluginController shared] newSessionAction]; }
+static void Cmd_Restart(void)        { [[RunPwshPluginController shared] restartAction]; }
 
 extern "C" {
 
@@ -496,10 +428,7 @@ NPP_EXPORT void setInfo(struct NppData data) {
     gFuncItems[3]._pFunc = Cmd_Stop;
 
     strlcpy(gFuncItems[4]._itemName, LocalizedFuncItemName(4).UTF8String, NPP_MENU_ITEM_SIZE);
-    gFuncItems[4]._pFunc = Cmd_OpenTerminal;
-
-    strlcpy(gFuncItems[5]._itemName, LocalizedFuncItemName(5).UTF8String, NPP_MENU_ITEM_SIZE);
-    gFuncItems[5]._pFunc = Cmd_NewSession;
+    gFuncItems[4]._pFunc = Cmd_Restart;
 }
 
 NPP_EXPORT const char *getName(void) {

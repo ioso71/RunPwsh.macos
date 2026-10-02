@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(RunPwsh OBJCXX CXX)
+project(RunPwsh VERSION 4.0.0 LANGUAGES OBJCXX CXX)
 
 # -----------------------------------------------------------------------------
 # Nextpad++ "RunPwsh" plugin
@@ -87,14 +87,20 @@ set(RUNPWSH_SWIFT_X86_64_DYLIB "${RUNPWSH_SWIFT_PKG_DIR}/.build/x86_64-apple-mac
 set(RUNPWSH_SWIFT_UNIVERSAL_DIR "${RUNPWSH_SWIFT_PKG_DIR}/.build/universal")
 set(RUNPWSH_SWIFT_DYLIB "${RUNPWSH_SWIFT_UNIVERSAL_DIR}/libRunPwshTerminalBridge.dylib")
 
+# `--build-system native`: since Swift 6.4 the default build system
+# (`swiftbuild`) no longer writes the Obj-C compatibility header to the
+# `-emit-objc-header-path` given in Package.swift, so include/
+# RunPwshTerminalBridge-Swift.h silently stayed at its old contents and new
+# @objc members were invisible to the .mm files. `native` still honours the
+# flag. It is marked deprecated by SwiftPM; revisit when it is removed.
 # Always invoked (no explicit output-timestamp tracking against the Swift
 # sources) — `swift build` already does its own incremental-build caching,
 # so this just re-asks it every CMake build and it's a fast no-op when
 # nothing changed. Simpler/more robust than trying to mirror SwiftPM's own
 # dependency graph in CMake.
 add_custom_target(RunPwshTerminalBridge_swiftbuild
-    COMMAND "${SWIFT_EXECUTABLE}" build -c release --arch arm64 --package-path "${RUNPWSH_SWIFT_PKG_DIR}"
-    COMMAND "${SWIFT_EXECUTABLE}" build -c release --arch x86_64 --package-path "${RUNPWSH_SWIFT_PKG_DIR}"
+    COMMAND "${SWIFT_EXECUTABLE}" build -c release --build-system native --arch arm64 --package-path "${RUNPWSH_SWIFT_PKG_DIR}"
+    COMMAND "${SWIFT_EXECUTABLE}" build -c release --build-system native --arch x86_64 --package-path "${RUNPWSH_SWIFT_PKG_DIR}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${RUNPWSH_SWIFT_UNIVERSAL_DIR}"
     COMMAND "${LIPO_EXECUTABLE}" -create -output "${RUNPWSH_SWIFT_DYLIB}" "${RUNPWSH_SWIFT_ARM64_DYLIB}" "${RUNPWSH_SWIFT_X86_64_DYLIB}"
     BYPRODUCTS "${RUNPWSH_SWIFT_DYLIB}" "${RUNPWSH_SWIFT_HEADER_DIR}/RunPwshTerminalBridge-Swift.h"

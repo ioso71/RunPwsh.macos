@@ -1,6 +1,6 @@
 # RunPwsh — Nextpad++ macOS Plugin
 
-**Version:** 3.1.5 — see [CHANGELOG.md](CHANGELOG.md) for the version history.
+**Version:** 4.0.0 — see [CHANGELOG.md](CHANGELOG.md) for the version history.
 
 A PowerShell-ISE-like panel for Nextpad++ (macOS): run the current script or
 just the current selection against a **single persistent `pwsh` session**
@@ -8,9 +8,9 @@ just the current selection against a **single persistent `pwsh` session**
 a **real embedded terminal** — type directly into it, arrow-key history and
 tab-completion work, masked credential prompts stay hidden, exactly like a
 real terminal window — interrupt a running command without losing the
-session, start a brand-new session when you actually want a clean slate,
-jump to an interactive `pwsh` session in Terminal.app, and — if PowerShell
-isn't installed yet — install it with one click via Homebrew. Built on the
+session, restart it when you actually want a clean slate, and — if PowerShell
+isn't installed yet — install it with one click via Homebrew. The behavior
+follows the PowerShell terminal of Visual Studio Code's PowerShell extension. Built on the
 same native Nextpad++ plugin
 API for macOS (`NppPluginInterfaceMac.h`, see `vendor/README.md`) as the
 [Finder plugin](../finder/README.md) in this repo, and follows several of
@@ -62,10 +62,12 @@ RunPwsh/
     │                            text retrieval via Scintilla SCI_GETSELTEXT,
     │                            lazy persistent-session startup
     ├── RunPwshPanelView.h/.mm   Toolbar (Run Script / Run Selection / Stop /
-    │                            New Session / Open in Terminal),
+    │                            Restart Session),
     │                            install-via-Homebrew banner, embedded
     │                            terminal (RunPwshTerminalBridge)
-    ├── RunPwshEngine.h/.mm      pwsh/brew discovery, Terminal.app launch,
+    ├── RunPwshSession.h/.mm     Session state machine (Idle → Starting → Ready
+    │                            ⇄ Running → Ended); "ready" = pwsh printed a prompt
+    ├── RunPwshEngine.h/.mm      pwsh/brew discovery,
     │                            Homebrew install (non-interactive NSTask)
     └── RunPwshLocalization.h/.mm  DE/EN localization (same pattern as the
                                     Finder plugin's FinderLocalization)
@@ -130,75 +132,65 @@ regardless of any future SwiftTerm-facing internal adjustments.
 
 ## Using it
 
-Since v3.0.0, the embedded terminal hosts one **persistent** interactive
-`pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass` session, started lazily on
-the first "Run Script"/"Run Selection" click rather than a fresh throwaway
-process per run. `$variables` and functions defined by one run are still
-there for the next — the whole point being that building `$cred` in one
-selection and reusing it in the next (e.g. for `Enter-PSSession
--Credential $cred`) no longer requires retyping it.
+The embedded terminal hosts one **persistent** interactive
+`pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass` session. Since v4.0.0 it
+**starts as soon as the panel is shown**, so the banner and the
+`PS <path>>` prompt are there and you can type right away. `$variables` and
+functions defined by one run are still there for the next.
 
-- **Script ausführen / Run Script** (green play button): saves the current
-  file (matching the PowerShell ISE's F5 behavior — if the buffer is
-  untitled, the host's Save dialog appears first), starts the session if one
-  isn't already running, then dot-sources the file (`. '<path>'`, after a
-  `Set-Location` into its folder) into that session — dot-sourcing, not the
-  call operator, so top-level variables/functions the script defines leak
-  into the session instead of vanishing with a child scope.
-- **Auswahl ausführen / Run Selection** (green rectangle button, matching
-  Run Script since v3.1.0): starts the session if needed, then types the
-  selected text directly into it — same effect as pasting it by hand at the
-  prompt, no temp `.ps1` file involved anymore. If nothing is selected, it
-  runs the line the cursor is currently on instead (v3.1.0, matching the real
-  PowerShell ISE's F8 behavior) — only if the caret isn't on any line and
-  there's truly nothing to run does it print "Keine Auswahl und keine
-  aktuelle Zeile vorhanden." / "No selection and no current line." If this
-  is the very first Run against a brand-new session, there's a short (~0.6s)
-  pause before it's actually typed in, so it doesn't race `pwsh`'s own
-  startup (v3.1.2), plus a follow-up safety-net Enter press ~1.5s later for
-  that first command only, in case the session was still slower to start
-  than that (v3.1.4). What's typed always ends with a real Enter keypress
-  (`\r`, not `\n` — v3.1.3, see the changelog if a command ever just sits
-  there un-executed again).
-- **Aktuellen Befehl abbrechen / Stop** (gray/red square): sends Ctrl+C to
-  interrupt whatever's currently running in the session — the session itself
-  (and everything defined in it so far) stays alive.
-- **Neue Sitzung starten / New Session** (circular-arrow icon): the
-  destructive action — ends the current `pwsh` process outright (SIGTERM,
-  escalating to SIGKILL after a short grace period) for a genuinely clean
-  slate. A later Run Script/Run Selection click lazily starts a fresh session.
-- **Pwsh in Terminal starten / Start Pwsh in Terminal** (terminal icon):
-  opens a new Terminal.app window with an interactive `pwsh` session, `cd`'d
-  into the current file's folder.
-- All of the above are also reachable from the editor's native right-click
-  context menu, under **"Plugin-Befehle" / "Plugin Commands" → RunPwsh**
-  (the host lists every plugin's commands there automatically) — select
-  text first, then choose "Auswahl ausführen" / "Run Selection" there for
-  the same effect as the toolbar button.
-- If no `pwsh` binary can be found, a banner appears above the console with
-  an **"Installieren via Homebrew" / "Install via Homebrew"** button (runs
-  `brew install --cask powershell`). If Homebrew itself isn't installed
-  either, the banner instead points to <https://brew.sh>.
-- **The console is a real, typeable terminal** (since v2.0.0): click into it
-  and type directly, same as any terminal app — arrow-key history,
-  tab-completion, and masked/secure prompts (`Get-Credential`,
-  `Enter-PSSession`'s credential fallback, `Read-Host -AsSecureString`,
-  `Connect-AzAccount`'s tenant/subscription picker) all work exactly like in
-  Terminal.app, because they're now backed by a real terminal widget
-  (SwiftTerm) instead of a read-only text view. There is no separate input
-  field anymore.
-- The console always uses a **fixed dark background with light text**
-  (regardless of the host's light/dark appearance setting), matching the
-  PowerShell ISE and most terminal apps.
+How "ready" is detected: the session starts `pwsh` with a `prompt` override
+that emits an OSC 7 sequence before every prompt. The terminal reports it to
+the plugin, which then knows `pwsh` is at a prompt. Runs requested earlier
+(while `pwsh` is still starting, or while another command is running) wait in
+a single queue slot and are sent at the next prompt; there are no timers.
+
+- **Run Script** (green play button): saves the current file (if the buffer
+  is untitled, the host's Save dialog appears first), then dot-sources it
+  (`. '<path>'`, after a `Set-Location` into its folder) so top-level
+  variables/functions stay in the session.
+- **Run Selection** (green rectangle button): types the selected text into
+  the session. With no selection it runs the current line (like F8 in VS
+  Code). Multi-line text is typed with a real Enter (`\r`) after each line.
+- **Stop** (gray/red square): Ctrl+C — interrupts the running command and
+  drops anything still queued. The session stays alive.
+- **Restart Session** (circular arrow): ends the `pwsh` process (SIGTERM,
+  then SIGKILL after a short grace period) and starts a fresh one.
+- If `pwsh` exits (`exit`, crash), the terminal prints "Session ended" and
+  **Restart Session** starts a new one.
+- All commands are also in the editor's right-click menu under
+  **Plugin Commands → RunPwsh**.
+- **Keyboard shortcuts:** the host ignores shortcuts proposed by plugins.
+  Assign F5 / F8 (or any key) yourself under **Edit → Shortcut Mapper… →
+  Plugins**.
+- If no `pwsh` binary can be found, a banner appears with an **Install via
+  Homebrew** button (runs `brew install --cask powershell`). If Homebrew is
+  missing too, the banner points to <https://brew.sh>.
+- **The console is a real, typeable terminal:** click into it and type
+  directly — arrow-key history, tab completion and masked prompts
+  (`Get-Credential`, `Read-Host -AsSecureString`, …) work as in any terminal,
+  because the widget is SwiftTerm. The console always uses a fixed dark
+  background with light text.
+
+## Running the unit tests
+
+The session state machine has plain assert-style tests (no XCTest, no host
+needed):
+
+```sh
+cmake -S . -B build
+cmake --build build --target run_session_tests
+```
+
+Everything else (terminal, docking, focus, keyboard input) is verified by hand
+in the running Nextpad++: open the panel, type, run a line and a selection,
+Stop, Restart Session, hide and show the panel, and dock it at the side and at
+the bottom.
 
 ## Known limitations
 
-See [CHANGELOG.md](CHANGELOG.md) — most notably: the panel currently docks
-via the same side-panel API as the Finder plugin; bottom-docking (like the
-real ISE) is planned for host release 1.1.1 (confirmed by the Nextpad++
-maintainer, 2026-08-24) — a small follow-up change is planned once that's
-out. (The previous "no persistent session across runs" limitation was
-addressed in v3.0.0 — see above.)
+See [CHANGELOG.md](CHANGELOG.md). Notably: only one terminal session (no
+terminal list like VS Code), and the panel is docked wherever the host puts it
+(side or bottom, via the panel's own dock buttons).
 
 ## License
 

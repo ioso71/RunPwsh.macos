@@ -10,14 +10,9 @@
 // resulting dynamic library — see the "Swift terminal bridge" section in
 // ../../CMakeLists.txt.
 //
-// IMPORTANT (see README.md "Building" + CHANGELOG 2.0.0): this file pins an
-// exact SwiftTerm version/commit. If SwiftTerm's LocalProcessTerminalView API
-// has shifted since (method/parameter names in RunPwshTerminalBridge.swift
-// were written from memory of the library, not against a checked-out copy —
-// this sandbox has no network access to verify against the real source), the
-// first `swift build` on a real Mac is where that will surface as a compile
-// error; fix the call sites in RunPwshTerminalBridge.swift to match whatever
-// the pinned version actually exposes.
+// IMPORTANT: this file pins an exact SwiftTerm version. The call sites in
+// RunPwshTerminalBridge.swift were checked against the real 1.2.0 source
+// (v2.0.1); if the pin is ever bumped, re-check them against the new source.
 import PackageDescription
 
 let package = Package(
