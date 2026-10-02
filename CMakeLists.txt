@@ -26,7 +26,10 @@ set(CMAKE_RANLIB /usr/bin/ranlib)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_OBJCXX_STANDARD 17)
-set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0")
+# 12.0, not 11.0: the Swift bridge (SwiftPM, Swift 6.x toolchain) is built with a
+# minimum of macOS 12.0, and linking a 11.0 plugin against it only produced an
+# "built for newer version 12.0" linker warning while promising macOS 11.
+set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0")
 if(NOT CMAKE_OSX_ARCHITECTURES)
     set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64")
 endif()

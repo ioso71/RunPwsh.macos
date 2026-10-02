@@ -76,6 +76,10 @@ extension.
   `ensureSessionStarted…completion:`.
 
 ### Changed
+- Minimum macOS is now **12.0** (was declared as 11.0): the Swift bridge is
+  built for 12.0 anyway, so the old setting only produced a linker warning
+  ("building for macOS-11.0, but linking with dylib … built for newer
+  version 12.0") and promised a version that could not load the plugin.
 - "New Session" is now **Restart Session**: it ends the process and starts a
   new one in one step.
 - After `exit` or a crash the terminal shows "Session ended" and Restart

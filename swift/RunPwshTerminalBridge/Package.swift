@@ -17,7 +17,7 @@ import PackageDescription
 
 let package = Package(
     name: "RunPwshTerminalBridge",
-    platforms: [.macOS(.v11)],
+    platforms: [.macOS(.v12)],
     products: [
         // Dynamic library so the ObjC++ plugin dylib can link/dlopen it at
         // runtime rather than needing to statically re-link Swift's runtime
