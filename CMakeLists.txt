@@ -36,6 +36,7 @@ set(RUNPWSH_SRCS
     src/RunPwshPanelView.mm
     src/RunPwshEngine.mm
     src/RunPwshLocalization.mm
+    src/RunPwshSession.mm
 )
 
 set(RUNPWSH_HDRS
@@ -43,6 +44,7 @@ set(RUNPWSH_HDRS
     src/RunPwshPanelView.h
     src/RunPwshEngine.h
     src/RunPwshLocalization.h
+    src/RunPwshSession.h
 )
 
 # -----------------------------------------------------------------------------
@@ -154,4 +156,22 @@ add_custom_target(install_plugin
     COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/resources" "${NPP_PLUGINS_DIR}/RunPwsh/resources"
     DEPENDS RunPwsh
     COMMENT "Installing RunPwsh.dylib, libRunPwshTerminalBridge.dylib and toolbar icons into ${NPP_PLUGINS_DIR}/RunPwsh/"
+)
+
+# -----------------------------------------------------------------------------
+# Unit tests for the session state machine (no host, no Swift bridge needed).
+# Usage: cmake --build build --target run_session_tests
+# -----------------------------------------------------------------------------
+add_executable(runpwsh_session_tests EXCLUDE_FROM_ALL
+    tests/RunPwshSessionTests.mm
+    src/RunPwshSession.mm
+)
+target_include_directories(runpwsh_session_tests PRIVATE "${CMAKE_SOURCE_DIR}/src")
+target_compile_options(runpwsh_session_tests PRIVATE -fobjc-arc -Wall -Wextra)
+target_link_libraries(runpwsh_session_tests PRIVATE "-framework Foundation")
+
+add_custom_target(run_session_tests
+    COMMAND runpwsh_session_tests
+    DEPENDS runpwsh_session_tests
+    COMMENT "Running RunPwshSession tests"
 )
