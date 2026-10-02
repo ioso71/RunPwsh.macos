@@ -10,17 +10,28 @@
 @property (nonatomic) int startCount, interruptCount, killCount;
 @property (nonatomic, copy) NSArray<NSString *> *lastArgs;
 @property (nonatomic, copy) NSString *lastCwd;
+@property (nonatomic) BOOL insideExit;     // SwiftTerm sets running=false only AFTER the exit callback returns
+@property (nonatomic) int refusedStarts;
 @end
 @implementation FakeTransport
 - (instancetype)init { if ((self = [super init])) _typed = [NSMutableArray array]; return self; }
 - (void)startWithExecutable:(NSString *)e args:(NSArray<NSString *> *)a currentDirectory:(NSString *)c {
+    if (_insideExit) { _refusedStarts++; return; }   // LocalProcess.startProcess: `if running { return }`
     _startCount++; _lastArgs = a; _lastCwd = c;
 }
 - (void)typeText:(NSString *)t { [_typed addObject:t]; }
 - (void)interrupt { _interruptCount++; }
 - (void)kill { _killCount++; }
 - (void)prompt { if (_onPrompt) _onPrompt(); }
-- (void)exitWith:(int32_t)code { if (_onExit) _onExit(code); }
+- (void)exitWith:(int32_t)code {
+    _insideExit = YES;
+    if (_onExit) _onExit(code);
+    _insideExit = NO;
+}
+// Runs work that the session deferred past the exit callback (dispatch_async to main).
+- (void)drain {
+    for (int i = 0; i < 5; i++) [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
+}
 @end
 
 static int gFailures = 0;
@@ -134,7 +145,7 @@ static void testRestartWhileRunningStartsExactlyOneNewSession(void) {
     [s restart];
     CHECK(t.killCount == 1);
     CHECK(t.startCount == 1);
-    [t exitWith:143];
+    [t exitWith:143]; [t drain];
     CHECK(t.startCount == 2);
     CHECK(s.state == RunPwshSessionStateStarting);
     [t prompt];
@@ -145,7 +156,7 @@ static void testRestartWhileStartingDoesNotEndNewSession(void) {
     FakeTransport *t; RunPwshSession *s = Make(&t);
     [s startWithExecutable:@"/bin/pwsh"];
     [s restart];
-    [t exitWith:143];
+    [t exitWith:143]; [t drain];
     CHECK(t.startCount == 2);
     CHECK(s.state == RunPwshSessionStateStarting);
 }
@@ -189,6 +200,87 @@ static void testStateChangeIsReported(void) {
     CHECK([seen isEqualToArray:expect]);
 }
 
+// ---- Fix pass: findings from the final review ----
+
+// Critical 1: a restart must not start pwsh from inside the exit callback.
+static void testRestartSpawnsAfterExitCallbackReturns(void) {
+    FakeTransport *t; RunPwshSession *s = Make(&t);
+    [s startWithExecutable:@"/bin/pwsh"]; [t prompt];
+    [s restart];
+    [t exitWith:143];
+    [t drain];
+    CHECK(t.refusedStarts == 0);
+    CHECK(t.startCount == 2);
+    CHECK(s.state == RunPwshSessionStateStarting);
+    [t prompt];
+    CHECK(s.state == RunPwshSessionStateReady);
+}
+
+// Important 2: a Run between Restart and the old exit is queued for the NEW session,
+// not typed into the dying process and not dropped.
+static void testRunBetweenRestartAndExitGoesToNewSession(void) {
+    FakeTransport *t; RunPwshSession *s = Make(&t);
+    [s startWithExecutable:@"/bin/pwsh"]; [t prompt];
+    [s restart];
+    CHECK([s runText:@"Get-Date"]);
+    CHECK(t.typed.count == 0);
+    [t prompt];                       // late prompt from the dying process must not release it
+    CHECK(t.typed.count == 0);
+    [t exitWith:143]; [t drain];
+    [t prompt];
+    CHECK(t.typed.count == 1 && [t.typed[0] isEqualToString:@"Get-Date\r"]);
+}
+
+static void testRunWhileRunningThenRestartKeepsNewRun(void) {
+    FakeTransport *t; RunPwshSession *s = Make(&t);
+    [s startWithExecutable:@"/bin/pwsh"]; [t prompt];
+    [s runText:@"Start-Sleep 30"];
+    [s restart];
+    [s runText:@"after-restart"];
+    [t exitWith:143]; [t drain]; [t prompt];
+    CHECK(t.typed.count == 2 && [t.typed[1] isEqualToString:@"after-restart\r"]);
+}
+
+// Important 1 (session part): Restart on an Ended session starts exactly one process.
+static void testRestartOnEndedStartsExactlyOnce(void) {
+    FakeTransport *t; RunPwshSession *s = Make(&t);
+    [s startWithExecutable:@"/bin/pwsh"]; [t prompt]; [t exitWith:0];
+    [s restart]; [t drain];
+    CHECK(t.startCount == 2);
+    CHECK(t.killCount == 0);
+    CHECK(s.state == RunPwshSessionStateStarting);
+}
+
+// Important 3: Stop must get a queued Run out of Starting/Running; state is observable.
+static void testInterruptWhileStartingDropsQueue(void) {
+    FakeTransport *t; RunPwshSession *s = Make(&t);
+    [s startWithExecutable:@"/bin/pwsh"];
+    [s runText:@"queued"];
+    CHECK(s.hasPending);
+    [s interrupt];
+    CHECK(!s.hasPending);
+    [t prompt];
+    CHECK(t.typed.count == 0);
+}
+
+// Important 6: tabs in typed code must not trigger PSReadLine completion.
+static void testTabsBecomeSpaces(void) {
+    FakeTransport *t; RunPwshSession *s = Make(&t);
+    [s startWithExecutable:@"/bin/pwsh"]; [t prompt];
+    [s runText:@"foreach ($i in 1..2) {\n\tWrite-Output $i\n}"];
+    CHECK([t.typed[0] rangeOfString:@"\t"].location == NSNotFound);
+    CHECK([t.typed[0] rangeOfString:@"    Write-Output"].location != NSNotFound);
+}
+
+// Terminate must not respawn even if the exit callback arrives later.
+static void testTerminateThenDrainDoesNotRespawn(void) {
+    FakeTransport *t; RunPwshSession *s = Make(&t);
+    [s startWithExecutable:@"/bin/pwsh"]; [t prompt];
+    [s terminate]; [t exitWith:143]; [t drain];
+    CHECK(t.startCount == 1);
+    CHECK(s.state == RunPwshSessionStateEnded);
+}
+
 int main(void) {
     @autoreleasepool {
         testStartPassesInitCommandAndHome();
@@ -206,6 +298,13 @@ int main(void) {
         testNormalisation();
         testTerminateDoesNotRestart();
         testStateChangeIsReported();
+        testRestartSpawnsAfterExitCallbackReturns();
+        testRunBetweenRestartAndExitGoesToNewSession();
+        testRunWhileRunningThenRestartKeepsNewRun();
+        testRestartOnEndedStartsExactlyOnce();
+        testInterruptWhileStartingDropsQueue();
+        testTabsBecomeSpaces();
+        testTerminateThenDrainDoesNotRespawn();
     }
     if (gFailures) { fprintf(stderr, "%d check(s) failed\n", gFailures); return 1; }
     printf("All session tests passed\n");

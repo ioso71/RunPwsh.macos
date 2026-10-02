@@ -226,10 +226,9 @@
         _session.onStateChange = ^(RunPwshSessionState state) {
             RunPwshPanelView *strongSelf = weakSelf;
             if (!strongSelf) return;
-            [strongSelf setSessionActive:(state == RunPwshSessionStateRunning)];
-            if (state == RunPwshSessionStateReady || state == RunPwshSessionStateStarting) {
-                [strongSelf focusTerminal];
-            }
+            // Stop stays usable while a command runs OR a Run is waiting for a
+            // prompt, so a stalled queue always has a way out.
+            [strongSelf setSessionActive:(state == RunPwshSessionStateRunning || strongSelf->_session.hasPending)];
             if (state == RunPwshSessionStateEnded) {
                 [strongSelf feedText:[NSString stringWithFormat:@"\n[%@]\n",
                     RPLoc(@"Sitzung beendet – „Sitzung neu starten“ drücken", @"Session ended – press Restart Session")]];
@@ -240,10 +239,16 @@
 }
 
 - (BOOL)runText:(NSString *)text {
-    return [_session runText:text];
+    BOOL accepted = [_session runText:text];
+    // A queued Run changes hasPending without changing the state.
+    [self setSessionActive:(_session.state == RunPwshSessionStateRunning || _session.hasPending)];
+    return accepted;
 }
 
-- (void)interruptSession { [_session interrupt]; }
+- (void)interruptSession {
+    [_session interrupt];
+    [self setSessionActive:(_session.state == RunPwshSessionStateRunning)];
+}
 - (void)restartSession { [_session restart]; }
 - (void)terminateSession { [_session terminate]; }
 

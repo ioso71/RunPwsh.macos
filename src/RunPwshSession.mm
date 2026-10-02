@@ -29,6 +29,7 @@
 }
 
 - (RunPwshSessionState)state { return _state; }
+- (BOOL)hasPending { return _pending != nil; }
 
 - (void)setState:(RunPwshSessionState)state {
     _state = state;
@@ -38,11 +39,11 @@
 - (void)startWithExecutable:(NSString *)executable {
     if (_state != RunPwshSessionStateIdle && _state != RunPwshSessionStateEnded) return;
     _executable = [executable copy];
+    _pending = nil;
     [self spawn];
 }
 
 - (void)spawn {
-    _pending = nil;
     _terminating = NO;
     [self setState:RunPwshSessionStateStarting];
     [_transport startWithExecutable:_executable
@@ -57,7 +58,10 @@
 }
 
 - (BOOL)runText:(NSString *)text {
-    NSString *t = [text stringByReplacingOccurrencesOfString:@"\r\n" withString:@"\r"];
+    // Tabs would trigger PSReadLine tab completion while typing; indentation
+    // is cosmetic for PowerShell, so send spaces instead.
+    NSString *t = [text stringByReplacingOccurrencesOfString:@"\t" withString:@"    "];
+    t = [t stringByReplacingOccurrencesOfString:@"\r\n" withString:@"\r"];
     t = [t stringByReplacingOccurrencesOfString:@"\n" withString:@"\r"];
     if ([t stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].length == 0) {
         return NO;
@@ -75,6 +79,7 @@
         case RunPwshSessionStateIdle:
         case RunPwshSessionStateEnded:
             if (!_executable) return NO;
+            _pending = nil;
             [self spawn];
             _pending = t;
             return YES;
@@ -82,6 +87,7 @@
 }
 
 - (void)handlePrompt {
+    if (_restartAfterExit) return;   // late prompt from the process being replaced
     if (_state != RunPwshSessionStateStarting && _state != RunPwshSessionStateRunning) return;
     [self setState:RunPwshSessionStateReady];
     if (_pending) {
@@ -92,10 +98,18 @@
 }
 
 - (void)handleExit:(int32_t)code {
-    _pending = nil;
+    if (!_restartAfterExit) _pending = nil;   // a restart keeps the Run queued for the new session
     if (_restartAfterExit && !_terminating) {
+        // SwiftTerm's LocalProcess clears `running` only AFTER this callback
+        // returns, and startProcess() is a no-op while `running` is set — so
+        // the new process must be started on the next run-loop turn.
         _restartAfterExit = NO;
-        [self spawn];
+        __weak RunPwshSession *weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            RunPwshSession *strongSelf = weakSelf;
+            if (!strongSelf || strongSelf->_terminating) return;
+            [strongSelf spawn];
+        });
         return;
     }
     [self setState:RunPwshSessionStateEnded];
@@ -108,11 +122,13 @@
 
 - (void)restart {
     if (_state == RunPwshSessionStateIdle || _state == RunPwshSessionStateEnded) {
-        if (_executable) [self spawn];
+        if (_executable) { _pending = nil; [self spawn]; }
         return;
     }
+    // New Runs queue for the NEW session from now on, never into the dying one.
     _restartAfterExit = YES;
     _pending = nil;
+    [self setState:RunPwshSessionStateStarting];
     [_transport kill];
 }
 

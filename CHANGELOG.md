@@ -37,11 +37,30 @@ extension.
   default build system, hiding new `@objc` members from the `.mm` files. The
   CMake target now builds the bridge with `--build-system native`.
 
+- `pwsh` could not find external programs (`ping`, `git`, …): SwiftTerm 1.2.0
+  leaves `PATH` out of the child environment. The bridge now passes the
+  host's environment on top of SwiftTerm's defaults.
+- Restart Session now works: the new process is started on the next run-loop
+  turn, because SwiftTerm only clears its `running` flag after the exit
+  callback returns (starting from inside it was silently ignored). A Run
+  requested between Restart and the old process's exit is kept for the new
+  session instead of being typed into the dying one.
+- Restart Session on an ended session starts exactly one process.
+- Stop stays available while a Run is waiting for a prompt, so a stalled
+  queue always has a way out.
+- Tabs in a Run Selection are sent as spaces so PSReadLine does not treat
+  them as tab completion.
+- The terminal no longer takes keyboard focus from the editor at app launch
+  or whenever a command finishes; it gets focus when the panel is shown or
+  clicked.
+
 ### Removed (breaking)
 - **"Start Pwsh in Terminal"** (menu command and toolbar button). The menu now
   has 5 commands instead of 6; command IDs after "Stop" shifted, so custom
   shortcuts assigned to the later commands may need to be set again under
-  Edit → Shortcut Mapper… → Plugins.
+  Edit → Shortcut Mapper… → Plugins. A shortcut that was on the old 5th
+  entry ("Start Pwsh in Terminal") now triggers **Restart Session**, which
+  discards the session's variables.
 - The startup grace period, the extra follow-up Enter and
   `ensureSessionStarted…completion:`.
 

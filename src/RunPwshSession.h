@@ -31,6 +31,9 @@ typedef NS_ENUM(NSInteger, RunPwshSessionState) {
 @interface RunPwshSession : NSObject
 
 @property (nonatomic, readonly) RunPwshSessionState state;
+/// YES while a Run request is waiting for the next prompt (the panel shows a
+/// hint and keeps Stop enabled so the user can always get out of a stall).
+@property (nonatomic, readonly) BOOL hasPending;
 /// Called on every state change (main thread).
 @property (nonatomic, copy, nullable) void (^onStateChange)(RunPwshSessionState state);
 

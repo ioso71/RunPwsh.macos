@@ -108,10 +108,24 @@ public class RunPwshTerminalBridge: NSObject {
         if let cwd = currentDirectory, !cwd.isEmpty {
             _ = fm.changeCurrentDirectoryPath(cwd)
         }
-        terminalView.startProcess(executable: executable, args: args, environment: nil, execName: nil)
+        terminalView.startProcess(executable: executable, args: args, environment: Self.childEnvironment(), execName: nil)
         if currentDirectory != nil {
             _ = fm.changeCurrentDirectoryPath(previousCwd)
         }
+    }
+
+    /// Environment for the child: SwiftTerm's own defaults (TERM, COLORTERM,
+    /// LANG) plus the host's environment. SwiftTerm 1.2.0 deliberately leaves
+    /// `PATH` out of its defaults (commented out in
+    /// `Terminal.getEnvironmentVariables`), so without this `pwsh` only sees
+    /// the shell's fallback PATH and cannot find `ping`, `git`, `brew`, …
+    private static func childEnvironment() -> [String] {
+        var env = Terminal.getEnvironmentVariables(termName: "xterm-256color")
+        let have = Set(env.compactMap { $0.split(separator: "=", maxSplits: 1).first.map(String.init) })
+        for (key, value) in ProcessInfo.processInfo.environment where !have.contains(key) {
+            env.append("\(key)=\(value)")
+        }
+        return env
     }
 
     /// Feeds `text` into the terminal as if it had been read from the child

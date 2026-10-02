@@ -219,8 +219,8 @@ static NSMenuItem *FindMenuItemWithTag(NSMenu *menu, NSInteger tag) {
         intptr_t result = nppData._sendMessage(nppData._nppHandle, NPPM_DMM_SHOWPANEL, self->_panelHandle, 0);
         self->_panelVisible = (result != 0);
         if (self->_panelVisible) {
+            // No focusTerminal here: at app launch the editor keeps the focus.
             [self startSessionIfNeeded];
-            [self->_panelView focusTerminal];
         }
     });
 }
@@ -359,8 +359,22 @@ static NSString *RunPwshEscapeSingleQuoted(NSString *path) {
 }
 
 - (void)restartAction {
-    [self ensurePanelShown];
-    [_panelView restartSession];
+    [self ensurePanelCreated];
+    [self refreshPwshStatus];
+    if (!_cachedPwshPath) return;
+    // Show the panel without auto-starting: restarting an Ended session must
+    // start exactly one process, and restarting a live one must not spawn a
+    // second process that is killed again right away.
+    if (_panelHandle && !_panelVisible) {
+        nppData._sendMessage(nppData._nppHandle, NPPM_DMM_SHOWPANEL, _panelHandle, 0);
+        _panelVisible = YES;
+    }
+    if (_panelView.sessionAlive) {
+        [_panelView restartSession];
+    } else {
+        [_panelView startSessionWithExecutable:_cachedPwshPath];
+    }
+    [_panelView focusTerminal];
 }
 
 - (void)installPwshAction {
