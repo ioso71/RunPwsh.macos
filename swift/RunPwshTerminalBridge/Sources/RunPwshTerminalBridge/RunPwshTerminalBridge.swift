@@ -52,6 +52,16 @@ public class RunPwshTerminalBridge: NSObject {
     /// it directly without re-dispatching).
     @objc public var onProcessExited: ((Int32) -> Void)?
 
+    /// Called (main thread) each time pwsh prints a prompt (OSC 7).
+    @objc public var onPrompt: (() -> Void)?
+
+    private var clickMonitor: Any?
+
+    /// Gives the terminal keyboard focus.
+    @objc public func focus() {
+        terminalView.window?.makeFirstResponder(terminalView)
+    }
+
     @objc public override init() {
         let tv = LocalProcessTerminalView(frame: .zero)
         // On German and many other macOS keyboard layouts, Option is needed
@@ -67,6 +77,20 @@ public class RunPwshTerminalBridge: NSObject {
         super.init()
         bridge.owner = self
         tv.processDelegate = bridge
+        // SwiftTerm 1.2.0 never makes the view first responder on click, and
+        // LocalProcessTerminalView is not `open`, so it cannot be subclassed.
+        // A local monitor gives it focus when the click lands on it.
+        clickMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak tv] event in
+            if let tv = tv, let win = tv.window, event.window === win {
+                let p = tv.convert(event.locationInWindow, from: nil)
+                if tv.bounds.contains(p), win.firstResponder !== tv { win.makeFirstResponder(tv) }
+            }
+            return event
+        }
+    }
+
+    deinit {
+        if let m = clickMonitor { NSEvent.removeMonitor(m) }
     }
 
     /// Starts `executable` with `args` attached to the terminal's own pty.
@@ -204,7 +228,9 @@ public class RunPwshTerminalBridge: NSObject {
 
         func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
         func setTerminalTitle(source: LocalProcessTerminalView, title: String) {}
-        func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
+        func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {
+            owner?.onPrompt?()
+        }
 
         func processTerminated(source: TerminalView, exitCode: Int32?) {
             owner?.onProcessExited?(exitCode ?? 0)
