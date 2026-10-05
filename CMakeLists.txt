@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(RunPwsh VERSION 4.0.0 LANGUAGES OBJCXX CXX)
+project(RunPwsh VERSION 4.0.1 LANGUAGES OBJCXX CXX)
 
 # -----------------------------------------------------------------------------
 # Nextpad++ "RunPwsh" plugin

@@ -19,7 +19,7 @@
  *   - Feature / medium change → minor (Y):   1.0.10 → 1.1.0
  *   - Breaking change         → major (XX):  1.9.0 → 2.0.0
  * ───────────────────────────────────────────────────────────────────────── */
-#define RUNPWSH_PLUGIN_VERSION "4.0.0"
+#define RUNPWSH_PLUGIN_VERSION "4.0.1"
 
 #import <Cocoa/Cocoa.h>
 #include <string.h>

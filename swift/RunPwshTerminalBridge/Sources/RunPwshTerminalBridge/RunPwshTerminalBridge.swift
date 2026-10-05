@@ -125,7 +125,43 @@ public class RunPwshTerminalBridge: NSObject {
         for (key, value) in ProcessInfo.processInfo.environment where !have.contains(key) {
             env.append("\(key)=\(value)")
         }
+        // A GUI app only inherits launchd's minimal PATH
+        // (/usr/bin:/bin:/usr/sbin:/sbin), which lacks Homebrew & co. Merge in
+        // the user's login-shell PATH, like VS Code's terminal does.
+        let path = mergedPath(current: ProcessInfo.processInfo.environment["PATH"])
+        env.removeAll { $0.hasPrefix("PATH=") }
+        env.append("PATH=\(path)")
         return env
+    }
+
+    private static func mergedPath(current: String?) -> String {
+        var parts = (current ?? "").split(separator: ":").map(String.init)
+        var extra = loginShellPath().split(separator: ":").map(String.init)
+        extra += ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/local/sbin",
+                  NSHomeDirectory() + "/.local/bin"]
+        for p in extra where !parts.contains(p) { parts.append(p) }
+        return parts.joined(separator: ":")
+    }
+
+    /// PATH as seen by the user's login shell ("" on failure or after 3 s).
+    private static func loginShellPath() -> String {
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: shell)
+        proc.arguments = ["-l", "-c", "printf %s \"$PATH\""]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        proc.standardInput = FileHandle.nullDevice
+        guard (try? proc.run()) != nil else { return "" }
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async { proc.waitUntilExit(); done.signal() }
+        if done.wait(timeout: .now() + 3) == .timedOut {
+            proc.terminate()
+            return ""
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8) ?? ""
     }
 
     /// Feeds `text` into the terminal as if it had been read from the child

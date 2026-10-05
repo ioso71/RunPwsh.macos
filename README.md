@@ -1,6 +1,6 @@
 # RunPwsh — Nextpad++ macOS Plugin
 
-**Version:** 4.0.0 — see [CHANGELOG.md](CHANGELOG.md) for the version history.
+**Version:** 4.0.1 — see [CHANGELOG.md](CHANGELOG.md) for the version history.
 
 A PowerShell-ISE-like panel for Nextpad++ (macOS): run the current script or
 just the current selection against a **single persistent `pwsh` session**

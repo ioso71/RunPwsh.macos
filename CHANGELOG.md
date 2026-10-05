@@ -7,6 +7,14 @@ Version scheme: `XX.Y.ZZ` (Major.Minor.Patch)
 - **Y** (Minor): medium updates / new features
 - **XX** (Major): large breaking changes
 
+## [4.0.1] — 2026-10-05
+
+### Fixed
+- Programs installed outside the system PATH (`az`, `brew`, `node`, …) were not
+  found in the terminal: a GUI app inherits only launchd's minimal PATH. The
+  bridge now merges the user's login-shell PATH (plus Homebrew and
+  `~/.local/bin`) into the pwsh environment.
+
 ## [4.0.0] — 2026-10-02
 
 Session rewrite, modelled on the PowerShell terminal of VS Code's PowerShell
