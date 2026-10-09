@@ -13,9 +13,11 @@ isn't installed yet — install it with one click via Homebrew. The behavior
 follows the PowerShell terminal of Visual Studio Code's PowerShell extension. Built on the
 same native Nextpad++ plugin
 API for macOS (`NppPluginInterfaceMac.h`, see `vendor/README.md`) as the
-[Finder plugin](../finder/README.md) in this repo, and follows several of
+[Finder plugin](https://github.com/ioso71/Finder.macos), and follows several of
 its established conventions directly (panel docking, SF-Symbol panel
 buttons, German/English localization).
+
+![RunPwsh docked at the bottom of Nextpad++](docs/panel-bottom.png)
 
 ## Dependencies
 
@@ -29,25 +31,28 @@ user explicitly clicks "Install via Homebrew") `brew` — none of these are
 build-time dependencies, just runtime executables the plugin looks for and,
 in the `pwsh` case, offers to install.
 
-## Important: can only be built on macOS
+## Requirements
 
-This plugin is Objective-C++ (`.mm`) and links against `Cocoa`/`Foundation`.
-It **cannot** be compiled in a Linux sandbox — that requires a Mac with the
-Command Line Tools (or Xcode) installed. Everything here was written by
-hand against the header conventions and existing patterns of the host repo
-and the Finder plugin (see "Known limitations" in CHANGELOG.md), but an
-actual compile run and manual test pass are still required on your end.
+macOS 12.0 or later (universal binary, arm64 + x86_64). Building needs Xcode
+or the Command Line Tools (Objective-C++ and the Swift toolchain) and CMake.
+It cannot be compiled on Linux. At runtime you need PowerShell (`pwsh`); the
+plugin offers to install it via Homebrew if it is missing.
 
 ## Structure
 
 ```
-RunPwsh/
+RunPwsh.macos/
 ├── CMakeLists.txt              Build configuration (produces RunPwsh.dylib;
 │                                also shells out to `swift build` for
 │                                swift/RunPwshTerminalBridge/ and links it in)
 ├── resources/
 │   ├── toolbar.png              Main toolbar/menu-band icon (light mode)
 │   └── toolbar_dark.png         Main toolbar/menu-band icon (dark mode)
+├── docs/
+│   └── panel-bottom.png         Screenshot used in this README
+├── tests/
+│   └── RunPwshSessionTests.mm   Unit tests for the session state machine
+├── THIRD-PARTY-NOTICES.md       License of the bundled SwiftTerm library
 ├── vendor/
 │   ├── NppPluginInterfaceMac.h  Unmodified copy of the plugin ABI from the host repo
 │   └── README.md                Provenance/sync note for the vendored file
@@ -88,7 +93,8 @@ access**: `cmake --build` shells out to `swift build` for the
 [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) as a dependency.
 
 ```sh
-cd /Volumes/S-Drive/Privat/Repository/Nextpad-plusplus/plugins/Plugins/RunPwsh
+git clone https://github.com/ioso71/RunPwsh.macos.git
+cd RunPwsh.macos
 cmake -S . -B build
 cmake --build build
 cmake --build build --target install_plugin
@@ -102,34 +108,12 @@ Swift bridge's build" below), copied by `install_plugin` to
 alongside `resources/`) — RunPwsh.dylib finds the Swift bridge dylib next to
 itself via an `@loader_path` rpath. Restart Nextpad++ to load it.
 
-**Note on the Swift bridge's build (v3.1.1)**: `swift build` with no `--arch`
-flag only ever builds for the host's own architecture (arm64 on Apple
-Silicon) — a real first build (2026-08-28) showed this as a linker warning
-(`ld: warning: ignoring file '...libRunPwshTerminalBridge.dylib': found
-architecture 'arm64', required architecture 'x86_64'`) rather than a hard
-failure, because `-undefined,dynamic_lookup` defers symbol resolution at
-link time. The build "succeeded" but would have produced an x86_64 slice of
-`RunPwsh.dylib` that could never actually load its Swift bridge on an Intel
-Mac. Fixed by building the Swift package for each architecture explicitly
-(`swift build --arch arm64` / `--arch x86_64`, each landing in SwiftPM's own
-`.build/<arch>-apple-macosx/release/`) and combining the two with `lipo`
-into a genuinely universal dylib, matching what `CMAKE_OSX_ARCHITECTURES`
-already does for `RunPwsh.dylib` itself.
-
-**Note on the Swift bridge's API calls**: `RunPwshTerminalBridge.swift` was
-originally written from memory of SwiftTerm's public API. The first real
-`swift build` (2026-08-26) caught one mismatch — `stopProcess()` tried to
-read `LocalProcessTerminalView.process` directly, but that property is
-`internal`, not `public`, in SwiftTerm 1.2.0 — fixed in v2.0.1 via Swift
-reflection (`Mirror`) to reach the pid, with a Ctrl+C-via-pty fallback if
-that ever breaks in a future SwiftTerm version. Everything else (`startProcess`,
-`feed(text:)`, the delegate protocol methods) has since been confirmed
-against the real vendored source and needed no changes. Since v3.0.0 the
-`@objc` surface RunPwshPanelView.mm relies on is
-start/feed/typeText/interrupt/killSession/onProcessExited (`stopProcess()`
-was renamed to `killSession()`; `typeText(_:)`/`interrupt()` were added for
-the persistent-session model — see "Using it" below) and stays stable
-regardless of any future SwiftTerm-facing internal adjustments.
+**Universal Swift bridge:** `swift build` without `--arch` only builds the
+host's architecture, so the CMake target builds the bridge for arm64 and
+x86_64 separately and combines them with `lipo`. The SwiftTerm version is
+pinned exactly in `Package.swift`; the bridge's `@objc` surface
+(start/feed/typeText/interrupt/killSession/onProcessExited) is what
+`RunPwshPanelView.mm` relies on.
 
 ## Using it
 
@@ -178,6 +162,25 @@ a single queue slot and are sent at the next prompt; there are no timers.
   because the widget is SwiftTerm. The console always uses a fixed dark
   background with light text.
 
+## The panel
+
+![RunPwsh panel docked at the bottom](docs/panel-bottom.png)
+
+The panel can be docked at the side or at the bottom of the window (as in the
+screenshot). Use the dock buttons in the panel's title bar at the top right to
+move it. Its own toolbar has four buttons, from left to right:
+
+| Button | Action |
+|---|---|
+| Green play | **Run Script**: save and dot-source the current file |
+| Green play in a rectangle | **Run Selection**: run the selection, or the current line |
+| Gray square | **Stop**: Ctrl+C (greyed out while nothing is running) |
+| Orange circular arrow | **Restart Session**: start a fresh `pwsh` |
+
+Next to the buttons the panel shows the `pwsh` binary in use. The plugin's
+main-toolbar icon (`resources/toolbar.png`, with a dark-mode variant) toggles
+the panel.
+
 ## Running the unit tests
 
 The session state machine has plain assert-style tests (no XCTest, no host
@@ -197,8 +200,9 @@ the bottom.
 
 See [CHANGELOG.md](CHANGELOG.md). Notably: only one terminal session (no
 terminal list like VS Code), and the panel is docked wherever the host puts it
-(side or bottom, via the panel's own dock buttons).
+(side or bottom, via the dock buttons in the panel's title bar).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). The bundled SwiftTerm library is also MIT
+licensed, see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
